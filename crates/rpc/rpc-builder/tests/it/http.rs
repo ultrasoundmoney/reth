@@ -77,12 +77,26 @@ where
 {
     let execution_payload: ExecutionPayloadValidation =
         serde_json::from_str(EXECUTION_PAYLOAD).unwrap();
+
+    // If the data is unaltered from the example it fails due to "unknown parent hash" since the
+    // given parent block is not known / included at the time of the test
+    let result =
+        ValidationApiClient::validate_builder_submission_v1(client, execution_payload.clone()).await;
     let expected_message =
         format!("Block parent [hash:{:?}] is not known.", execution_payload.parent_hash);
-    let result =
-        ValidationApiClient::validate_builder_submission_v1(client, execution_payload).await;
     let error_message = get_call_error_message(result.unwrap_err()).unwrap();
     assert_eq!(error_message, expected_message);
+
+    let old_timestamp = format!("{:}", execution_payload.timestamp);
+    let new_timestamp = "1234567";
+    let execution_payload_wrong_timestamp: ExecutionPayloadValidation =
+        serde_json::from_str(&EXECUTION_PAYLOAD.replace(&old_timestamp, new_timestamp)).unwrap();
+    let result =
+        ValidationApiClient::validate_builder_submission_v1(client, execution_payload_wrong_timestamp).await;
+    let error_message = get_call_error_message(result.unwrap_err()).unwrap();
+    assert!(error_message.contains("blockhash mismatch"));
+
+
 }
 
 async fn test_basic_eth_calls<C>(client: &C)
