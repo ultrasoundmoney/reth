@@ -9424,6 +9424,8 @@ dependencies = [
  "reth-engine-primitives",
  "reth-network-peers",
  "reth-rpc-eth-api",
+ "serde",
+ "serde_with",
 ]
 
 [[package]]

@@ -4,7 +4,6 @@ use alloy_consensus::{
 use alloy_eips::{eip4844::kzg_to_versioned_hash, eip7685::RequestsOrHash};
 use alloy_rpc_types_beacon::relay::{
     BidTrace, BuilderBlockValidationRequest, BuilderBlockValidationRequestV2,
-    BuilderBlockValidationRequestV3, BuilderBlockValidationRequestV4,
 };
 use alloy_rpc_types_engine::{
     BlobsBundleV1, CancunPayloadFields, ExecutionData, ExecutionPayload, ExecutionPayloadSidecar,
@@ -26,7 +25,10 @@ use reth_primitives_traits::{
 };
 use reth_provider::{BlockExecutionOutput, BlockReaderIdExt, StateProviderFactory};
 use reth_revm::{cached::CachedReads, database::StateProviderDatabase};
-use reth_rpc_api::BlockSubmissionValidationApiServer;
+use reth_rpc_api::{
+    BlockSubmissionValidationApiServer, BuilderBlockValidationRequestV3,
+    BuilderBlockValidationRequestV4, TransactionFilter,
+};
 use reth_rpc_server_types::result::internal_rpc_err;
 use reth_tasks::TaskSpawner;
 use revm_primitives::{Address, B256, U256};
@@ -112,6 +114,7 @@ where
         block: RecoveredBlock<<E::Primitives as NodePrimitives>::Block>,
         message: BidTrace,
         registered_gas_limit: u64,
+        transaction_filter: TransactionFilter,
     ) -> Result<(), ValidationApiError> {
         self.validate_message_against_header(block.sealed_header(), &message)?;
 
@@ -119,7 +122,7 @@ where
         self.consensus.validate_header(block.sealed_header())?;
         self.consensus.validate_block_pre_execution(block.sealed_block())?;
 
-        if !self.disallow.is_empty() {
+        if !self.disallow.is_empty() && transaction_filter != TransactionFilter::None {
             if self.disallow.contains(&block.beneficiary()) {
                 return Err(ValidationApiError::Blacklist(block.beneficiary()))
             }
@@ -369,6 +372,7 @@ where
             block,
             request.request.message,
             request.registered_gas_limit,
+            request.transaction_filter,
         )
         .await
     }
@@ -397,6 +401,7 @@ where
             block,
             request.request.message,
             request.registered_gas_limit,
+            request.transaction_filter,
         )
         .await
     }
