@@ -4,8 +4,6 @@ use alloy_consensus::{
 use alloy_eips::{eip4844::kzg_to_versioned_hash, eip7685::RequestsOrHash};
 use alloy_rpc_types_beacon::relay::{
     BidTrace, BuilderBlockValidationRequest, BuilderBlockValidationRequestV2,
-    BuilderBlockValidationRequestV3, BuilderBlockValidationRequestV4,
-    BuilderBlockValidationRequestV5,
 };
 use alloy_rpc_types_engine::{
     BlobsBundleV1, BlobsBundleV2, CancunPayloadFields, ExecutionData, ExecutionPayload,
@@ -33,7 +31,10 @@ use reth_primitives_traits::{
     SealedBlock, SealedHeaderFor,
 };
 use reth_revm::{cached::CachedReads, database::StateProviderDatabase};
-use reth_rpc_api::BlockSubmissionValidationApiServer;
+use reth_rpc_api::{
+    BlockSubmissionValidationApiServer, BuilderBlockValidationRequestV3,
+    BuilderBlockValidationRequestV4, BuilderBlockValidationRequestV5, TransactionFilter,
+};
 use reth_rpc_server_types::result::{internal_rpc_err, invalid_params_rpc_err};
 use reth_storage_api::{BlockReaderIdExt, StateProviderFactory};
 use reth_tasks::TaskSpawner;
@@ -126,27 +127,28 @@ where
         block: RecoveredBlock<<E::Primitives as NodePrimitives>::Block>,
         message: BidTrace,
         registered_gas_limit: u64,
+        transaction_filter: TransactionFilter,
     ) -> Result<(), ValidationApiError> {
         self.validate_message_against_header(block.sealed_header(), &message)?;
 
         self.consensus.validate_header(block.sealed_header())?;
         self.consensus.validate_block_pre_execution(block.sealed_block())?;
 
-        if !self.disallow.is_empty() {
+        if !self.disallow.is_empty() && transaction_filter != TransactionFilter::None {
             if self.disallow.contains(&block.beneficiary()) {
-                return Err(ValidationApiError::Blacklist(block.beneficiary()))
+                return Err(ValidationApiError::Blacklist(block.beneficiary()));
             }
             if self.disallow.contains(&message.proposer_fee_recipient) {
-                return Err(ValidationApiError::Blacklist(message.proposer_fee_recipient))
+                return Err(ValidationApiError::Blacklist(message.proposer_fee_recipient));
             }
             for (sender, tx) in block.senders_iter().zip(block.body().transactions()) {
                 if self.disallow.contains(sender) {
-                    return Err(ValidationApiError::Blacklist(*sender))
+                    return Err(ValidationApiError::Blacklist(*sender));
                 }
-                if let Some(to) = tx.to() &&
-                    self.disallow.contains(&to)
+                if let Some(to) = tx.to()
+                    && self.disallow.contains(&to)
                 {
-                    return Err(ValidationApiError::Blacklist(to))
+                    return Err(ValidationApiError::Blacklist(to));
                 }
             }
         }
@@ -163,10 +165,10 @@ where
                 .sealed_header_by_hash(block.parent_hash())?
                 .ok_or_else(|| ValidationApiError::MissingParentBlock)?;
 
-            if latest_header.number().saturating_sub(parent_header.number()) >
-                self.validation_window
+            if latest_header.number().saturating_sub(parent_header.number())
+                > self.validation_window
             {
-                return Err(ValidationApiError::BlockTooOld)
+                return Err(ValidationApiError::BlockTooOld);
             }
             parent_header
         };
@@ -195,7 +197,7 @@ where
         })?;
 
         if let Some(account) = accessed_blacklisted {
-            return Err(ValidationApiError::Blacklist(account))
+            return Err(ValidationApiError::Blacklist(account));
         }
 
         // update the cached reads
@@ -212,7 +214,7 @@ where
             return Err(ConsensusError::BodyStateRootDiff(
                 GotExpected { got: state_root, expected: block.header().state_root() }.into(),
             )
-            .into())
+            .into());
         }
 
         Ok(())
@@ -271,7 +273,7 @@ where
             return Err(ValidationApiError::GasLimitMismatch(GotExpected {
                 got: header.gas_limit(),
                 expected: best_gas_limit,
-            }))
+            }));
         }
 
         Ok(())
@@ -309,7 +311,7 @@ where
         }
 
         if balance_after >= balance_before.saturating_add(message.value) {
-            return Ok(())
+            return Ok(());
         }
 
         let (receipt, tx) = output
@@ -319,25 +321,25 @@ where
             .ok_or(ValidationApiError::ProposerPayment)?;
 
         if !receipt.status() {
-            return Err(ValidationApiError::ProposerPayment)
+            return Err(ValidationApiError::ProposerPayment);
         }
 
         if tx.to() != Some(message.proposer_fee_recipient) {
-            return Err(ValidationApiError::ProposerPayment)
+            return Err(ValidationApiError::ProposerPayment);
         }
 
         if tx.value() != message.value {
-            return Err(ValidationApiError::ProposerPayment)
+            return Err(ValidationApiError::ProposerPayment);
         }
 
         if !tx.input().is_empty() {
-            return Err(ValidationApiError::ProposerPayment)
+            return Err(ValidationApiError::ProposerPayment);
         }
 
-        if let Some(block_base_fee) = block.header().base_fee_per_gas() &&
-            tx.effective_tip_per_gas(block_base_fee).unwrap_or_default() != 0
+        if let Some(block_base_fee) = block.header().base_fee_per_gas()
+            && tx.effective_tip_per_gas(block_base_fee).unwrap_or_default() != 0
         {
-            return Err(ValidationApiError::ProposerPayment)
+            return Err(ValidationApiError::ProposerPayment);
         }
 
         Ok(())
@@ -348,10 +350,10 @@ where
         &self,
         mut blobs_bundle: BlobsBundleV1,
     ) -> Result<Vec<B256>, ValidationApiError> {
-        if blobs_bundle.commitments.len() != blobs_bundle.proofs.len() ||
-            blobs_bundle.commitments.len() != blobs_bundle.blobs.len()
+        if blobs_bundle.commitments.len() != blobs_bundle.proofs.len()
+            || blobs_bundle.commitments.len() != blobs_bundle.blobs.len()
         {
-            return Err(ValidationApiError::InvalidBlobsBundle)
+            return Err(ValidationApiError::InvalidBlobsBundle);
         }
 
         let versioned_hashes = blobs_bundle
@@ -402,6 +404,7 @@ where
             block,
             request.request.message,
             request.registered_gas_limit,
+            request.transaction_filter,
         )
         .await
     }
@@ -430,6 +433,7 @@ where
             block,
             request.request.message,
             request.registered_gas_limit,
+            request.transaction_filter,
         )
         .await
     }
@@ -457,8 +461,8 @@ where
 
         // Check block size as per EIP-7934 (only applies when Osaka hardfork is active)
         let chain_spec = self.provider.chain_spec();
-        if chain_spec.is_osaka_active_at_timestamp(block.timestamp()) &&
-            block.rlp_length() > MAX_RLP_BLOCK_SIZE
+        if chain_spec.is_osaka_active_at_timestamp(block.timestamp())
+            && block.rlp_length() > MAX_RLP_BLOCK_SIZE
         {
             return Err(ValidationApiError::Consensus(ConsensusError::BlockTooLarge {
                 rlp_length: block.rlp_length(),
@@ -470,6 +474,7 @@ where
             block,
             request.request.message,
             request.registered_gas_limit,
+            request.transaction_filter,
         )
         .await
     }
@@ -662,20 +667,20 @@ pub enum ValidationApiError {
 impl From<ValidationApiError> for ErrorObject<'static> {
     fn from(error: ValidationApiError) -> Self {
         match error {
-            ValidationApiError::GasLimitMismatch(_) |
-            ValidationApiError::GasUsedMismatch(_) |
-            ValidationApiError::ParentHashMismatch(_) |
-            ValidationApiError::BlockHashMismatch(_) |
-            ValidationApiError::Blacklist(_) |
-            ValidationApiError::ProposerPayment |
-            ValidationApiError::InvalidBlobsBundle |
-            ValidationApiError::Blob(_) => invalid_params_rpc_err(error.to_string()),
+            ValidationApiError::GasLimitMismatch(_)
+            | ValidationApiError::GasUsedMismatch(_)
+            | ValidationApiError::ParentHashMismatch(_)
+            | ValidationApiError::BlockHashMismatch(_)
+            | ValidationApiError::Blacklist(_)
+            | ValidationApiError::ProposerPayment
+            | ValidationApiError::InvalidBlobsBundle
+            | ValidationApiError::Blob(_) => invalid_params_rpc_err(error.to_string()),
 
-            ValidationApiError::MissingLatestBlock |
-            ValidationApiError::MissingParentBlock |
-            ValidationApiError::BlockTooOld |
-            ValidationApiError::Consensus(_) |
-            ValidationApiError::Provider(_) => internal_rpc_err(error.to_string()),
+            ValidationApiError::MissingLatestBlock
+            | ValidationApiError::MissingParentBlock
+            | ValidationApiError::BlockTooOld
+            | ValidationApiError::Consensus(_)
+            | ValidationApiError::Provider(_) => internal_rpc_err(error.to_string()),
             ValidationApiError::Execution(err) => match err {
                 error @ BlockExecutionError::Validation(_) => {
                     invalid_params_rpc_err(error.to_string())

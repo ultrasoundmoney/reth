@@ -10169,6 +10169,8 @@ dependencies = [
  "reth-network-peers",
  "reth-rpc-eth-api",
  "reth-trie-common",
+ "serde",
+ "serde_with",
 ]
 
 [[package]]
