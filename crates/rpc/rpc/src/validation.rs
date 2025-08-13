@@ -36,7 +36,9 @@ use reth_rpc_api::{
     BuilderBlockValidationRequestV4, BuilderBlockValidationRequestV5, TransactionFilter,
 };
 use reth_rpc_server_types::result::{internal_rpc_err, invalid_params_rpc_err};
-use reth_storage_api::{BlockReaderIdExt, StateProviderFactory};
+use reth_storage_api::{
+    BlockReaderIdExt, HashedPostStateProvider, StateProviderFactory, StateRootProvider,
+};
 use reth_tasks::TaskSpawner;
 use revm_primitives::{Address, B256, U256};
 use serde::{Deserialize, Serialize};
@@ -44,6 +46,24 @@ use sha2::{Digest, Sha256};
 use std::{collections::HashSet, sync::Arc};
 use tokio::sync::{oneshot, RwLock};
 use tracing::warn;
+
+/// Computes the ratio `proposer_paid` / (`proposer_paid` + `coinbase_delta`) in basis points
+/// (x100 of percent). Returns `None` if the denominator is zero.
+fn mev_ratio_bps(proposer_paid: U256, coinbase_delta: U256) -> Option<u128> {
+    let denom = proposer_paid.saturating_add(coinbase_delta);
+    // Proposer and builder are paid zero. Can't determine ratio.
+    if denom.is_zero() {
+        return None;
+    }
+    (proposer_paid.saturating_mul(U256::from(10_000u64)) / denom).try_into().ok()
+}
+
+/// Formats basis points (1/100th of a percent) as a percentage string with two decimals.
+fn fmt_percent_2dp(bps: u128) -> String {
+    let integer = bps / 100;
+    let frac = bps % 100;
+    format!("{integer}.{frac:02}%")
+}
 
 /// The type that implements the `validation` rpc namespace trait
 #[derive(Clone, Debug, derive_more::Deref)]
@@ -128,6 +148,7 @@ where
         message: BidTrace,
         registered_gas_limit: u64,
         transaction_filter: TransactionFilter,
+        is_mev_protect: bool,
     ) -> Result<(), ValidationApiError> {
         self.validate_message_against_header(block.sealed_header(), &message)?;
 
@@ -205,7 +226,7 @@ where
 
         self.consensus.validate_block_post_execution(&block, &output)?;
 
-        self.ensure_payment(&block, &output, &message)?;
+        self.ensure_payment(&block, &output, &message, is_mev_protect)?;
 
         let state_root =
             state_provider.state_root(state_provider.hashed_post_state(&output.state))?;
@@ -281,13 +302,23 @@ where
 
     /// Ensures that the proposer has received [`BidTrace::value`] for this block.
     ///
-    /// Firstly attempts to verify the payment by checking the state changes, otherwise falls back
-    /// to checking the latest block transaction.
+    /// Two validation paths are attempted, in this order, to keep behavior compatible with
+    /// upstream:
+    /// - Balance-delta path: accept if the proposer's balance increased by exactly the bid amount
+    ///   (after withdrawals). This shortcut is disabled when MEV-protect is enabled.
+    /// - Last-transaction path: otherwise (or always when MEV-protect is enabled), require that the
+    ///   last tx is a direct payment to the proposer for exactly the bid amount with zero input and
+    ///   zero tip.
+    ///
+    /// MEV-protect notes:
+    /// - When MEV-protect is enabled, we require the last-transaction path to be satisfied and
+    ///   enforce the 90% ratio check against coinbase delta.
     fn ensure_payment(
         &self,
         block: &SealedBlock<<E::Primitives as NodePrimitives>::Block>,
         output: &BlockExecutionOutput<<E::Primitives as NodePrimitives>::Receipt>,
         message: &BidTrace,
+        is_mev_protect: bool,
     ) -> Result<(), ValidationApiError> {
         let (mut balance_before, balance_after) = if let Some(acc) =
             output.state.state.get(&message.proposer_fee_recipient)
@@ -311,14 +342,24 @@ where
         }
 
         if balance_after >= balance_before.saturating_add(message.value) {
-            return Ok(());
+            // Balance-delta shortcut: accepted only when MEV-protect is NOT requested.
+            // If MEV-protect is enabled, we still require the last-transaction path
+            // (including all checks and the ratio requirement) to pass.
+            if !is_mev_protect {
+                return Ok(());
+            }
         }
 
-        let (receipt, tx) = output
-            .receipts
-            .last()
-            .zip(block.body().transactions().last())
-            .ok_or(ValidationApiError::ProposerPayment)?;
+        let (receipt, tx) =
+            output.receipts.last().zip(block.body().transactions().last()).ok_or_else(|| {
+                if is_mev_protect {
+                    ValidationApiError::MevProtectFailed(
+                        "protectcheckfailed: mev-protect enabled but block invalid. proposer payment last tx missing. block accepted now but may be rejected in the future. contact t.me/ultrasoundrelay to learn more about supporting mev-protect.".to_string(),
+                    )
+                } else {
+                    ValidationApiError::ProposerPayment
+                }
+            })?;
 
         if !receipt.status() {
             return Err(ValidationApiError::ProposerPayment);
@@ -340,6 +381,42 @@ where
             && tx.effective_tip_per_gas(block_base_fee).unwrap_or_default() != 0
         {
             return Err(ValidationApiError::ProposerPayment);
+        }
+
+        // MEV-protect additional check: ensure last tx value >= 90% of coinbase delta.
+        // Note: the ratio is currently enforced only in this (last-transaction) path.
+        if is_mev_protect {
+            // Compute coinbase delta using state changes.
+            let beneficiary = block.beneficiary();
+            let (coinbase_before, coinbase_after) =
+                if let Some(acc) = output.state.state.get(&beneficiary) {
+                    let before = acc.original_info.as_ref().map(|i| i.balance).unwrap_or_default();
+                    let after = acc.info.as_ref().map(|i| i.balance).unwrap_or_default();
+                    (before, after)
+                } else {
+                    (U256::ZERO, U256::ZERO)
+                };
+
+            let coinbase_delta = if coinbase_after > coinbase_before {
+                coinbase_after - coinbase_before
+            } else {
+                U256::ZERO
+            };
+
+            // Compute ratio against total: proposer_paid / (proposer_paid + coinbase_delta) >= 90%
+            let proposer_paid = tx.value();
+            let denom = proposer_paid.saturating_add(coinbase_delta);
+            if !denom.is_zero() {
+                let lhs = proposer_paid.saturating_mul(U256::from(10_000u64));
+                let rhs = denom.saturating_mul(U256::from(9_000u64));
+                if lhs < rhs {
+                    let paid_bps = mev_ratio_bps(proposer_paid, coinbase_delta).unwrap_or(0);
+                    let paid_pct = fmt_percent_2dp(paid_bps);
+                    return Err(ValidationApiError::MevProtectFailed(format!(
+                        "protectcheckfailed: mev-protect enabled but block invalid. ratio (proposer_paid / (proposer_paid + coinbase_delta)) = {paid_pct}, required >= 90.00%. block accepted now but may be rejected in the future. contact t.me/ultrasoundrelay to learn more about supporting mev-protect."
+                    )));
+                }
+            }
         }
 
         Ok(())
@@ -405,6 +482,7 @@ where
             request.request.message,
             request.registered_gas_limit,
             request.transaction_filter,
+            request.is_mev_protect,
         )
         .await
     }
@@ -434,6 +512,7 @@ where
             request.request.message,
             request.registered_gas_limit,
             request.transaction_filter,
+            request.is_mev_protect,
         )
         .await
     }
@@ -475,6 +554,7 @@ where
             request.request.message,
             request.registered_gas_limit,
             request.transaction_filter,
+            request.is_mev_protect,
         )
         .await
     }
@@ -652,6 +732,8 @@ pub enum ValidationApiError {
     InvalidBlobsBundle,
     #[error("block accesses blacklisted address: {_0}")]
     Blacklist(Address),
+    #[error("{_0}")]
+    MevProtectFailed(String),
     #[error(transparent)]
     Blob(#[from] BlobTransactionValidationError),
     #[error(transparent)]
@@ -674,7 +756,8 @@ impl From<ValidationApiError> for ErrorObject<'static> {
             | ValidationApiError::Blacklist(_)
             | ValidationApiError::ProposerPayment
             | ValidationApiError::InvalidBlobsBundle
-            | ValidationApiError::Blob(_) => invalid_params_rpc_err(error.to_string()),
+            | ValidationApiError::Blob(_)
+            | ValidationApiError::MevProtectFailed(_) => invalid_params_rpc_err(error.to_string()),
 
             ValidationApiError::MissingLatestBlock
             | ValidationApiError::MissingParentBlock
@@ -705,8 +788,8 @@ pub(crate) struct ValidationMetrics {
 
 #[cfg(test)]
 mod tests {
-    use super::hash_disallow_list;
-    use revm_primitives::Address;
+    use super::{hash_disallow_list, mev_ratio_bps};
+    use revm_primitives::{Address, U256};
     use std::collections::HashSet;
 
     #[test]
@@ -760,5 +843,42 @@ mod tests {
         let expected_hash = "ee14e9d115e182f61871a5a385ab2f32ecf434f3b17bdbacc71044810d89e608";
         let hash = hash_disallow_list(&blocklist);
         assert_eq!(expected_hash, hash);
+    }
+
+    #[test]
+    fn test_mev_protect_missing_last_tx_prefix() {
+        let err = super::ValidationApiError::MevProtectFailed(
+            "protectcheckfailed: proposer_payment_last_tx_missing".to_string(),
+        );
+        assert!(err.to_string().starts_with("protectcheckfailed:"));
+    }
+
+    #[test]
+    fn test_mev_protect_insufficient_ratio_prefix() {
+        let err = super::ValidationApiError::MevProtectFailed(
+            "protectcheckfailed: insufficient_proposer_payment paid_x100=8750 required_x100=9000"
+                .to_string(),
+        );
+        assert!(err.to_string().starts_with("protectcheckfailed:"));
+    }
+
+    #[test]
+    fn test_mev_ratio_bps() {
+        // proposer_paid/(proposer_paid+coinbase_delta) with proposer_paid=9, coinbase_delta=1
+        assert_eq!(mev_ratio_bps(U256::from(9u64), U256::from(1u64)), Some(9000));
+
+        // 100/(100+11) => 100/111 ≈ 9009 bps
+        assert_eq!(mev_ratio_bps(U256::from(100u64), U256::from(11u64)), Some(9009));
+
+        // denom zero treated as None
+        assert_eq!(mev_ratio_bps(U256::ZERO, U256::ZERO), None);
+    }
+
+    #[test]
+    fn test_fmt_percent_2dp() {
+        assert_eq!(super::fmt_percent_2dp(0), "0.00%");
+        assert_eq!(super::fmt_percent_2dp(1), "0.01%");
+        assert_eq!(super::fmt_percent_2dp(90_00), "90.00%");
+        assert_eq!(super::fmt_percent_2dp(9_009), "90.09%");
     }
 }
