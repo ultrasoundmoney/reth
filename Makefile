@@ -37,6 +37,9 @@ EEST_TESTS_DIR := ./testing/ef-tests/execution-spec-tests
 
 # The docker image name
 DOCKER_IMAGE_NAME ?= ghcr.io/paradigmxyz/reth
+ 
+# Platforms to build for (used by docker buildx)
+BUILD_PLATFORMS ?= linux/amd64,linux/arm64
 
 ##@ Help
 
@@ -277,7 +280,7 @@ define docker_build_push
 	cp $(CARGO_TARGET_DIR)/aarch64-unknown-linux-gnu/$(PROFILE)/reth $(BIN_DIR)/arm64/reth
 
 	docker buildx build --file ./Dockerfile.cross . \
-		--platform linux/amd64,linux/arm64 \
+		--platform $(BUILD_PLATFORMS) \
 		--tag $(DOCKER_IMAGE_NAME):$(1) \
 		--tag $(DOCKER_IMAGE_NAME):$(2) \
 		--provenance=false \
@@ -346,7 +349,7 @@ define op_docker_build_push
 	cp $(CARGO_TARGET_DIR)/aarch64-unknown-linux-gnu/$(PROFILE)/op-reth $(BIN_DIR)/arm64/op-reth
 
 	docker buildx build --file ./DockerfileOp.cross . \
-		--platform linux/amd64,linux/arm64 \
+		--platform $(BUILD_PLATFORMS) \
 		--tag $(DOCKER_IMAGE_NAME):$(1) \
 		--tag $(DOCKER_IMAGE_NAME):$(2) \
 		--provenance=false \
