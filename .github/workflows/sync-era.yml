@@ -4,8 +4,6 @@ name: sync-era test
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "0 */6 * * *"
 
 env:
   CARGO_TERM_COLOR: always
