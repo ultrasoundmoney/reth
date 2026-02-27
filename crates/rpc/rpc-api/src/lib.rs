@@ -53,7 +53,10 @@ pub mod servers {
         testing::TestingApiServer,
         trace::TraceApiServer,
         txpool::TxPoolApiServer,
-        validation::BlockSubmissionValidationApiServer,
+        validation::{
+            BlockSubmissionValidationApiServer, BuilderBlockValidationRequestV3,
+            BuilderBlockValidationRequestV4, BuilderBlockValidationRequestV5, TransactionFilter,
+        },
         web3::Web3ApiServer,
     };
     pub use reth_rpc_eth_api::{
@@ -85,7 +88,10 @@ pub mod clients {
         testing::TestingApiClient,
         trace::TraceApiClient,
         txpool::TxPoolApiClient,
-        validation::BlockSubmissionValidationApiClient,
+        validation::{
+            BlockSubmissionValidationApiClient, BuilderBlockValidationRequestV3,
+            BuilderBlockValidationRequestV4, BuilderBlockValidationRequestV5, TransactionFilter,
+        },
         web3::Web3ApiClient,
     };
     pub use reth_rpc_eth_api::{

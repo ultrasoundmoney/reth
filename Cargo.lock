@@ -9682,6 +9682,7 @@ dependencies = [
  "reth-trie-common",
  "serde",
  "serde_json",
+ "serde_with",
  "tokio",
 ]
 
