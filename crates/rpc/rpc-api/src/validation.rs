@@ -19,6 +19,12 @@ pub enum TransactionFilter {
     OFAC,
 }
 
+impl Default for TransactionFilter {
+    fn default() -> Self {
+        Self::None
+    }
+}
+
 #[serde_as]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[allow(missing_docs)]
@@ -31,7 +37,11 @@ pub struct BuilderBlockValidationRequestV3 {
     pub registered_gas_limit: u64,
     /// The parent beacon block root for the validation request.
     pub parent_beacon_block_root: B256,
+    #[serde(default)]
     pub transaction_filter: TransactionFilter,
+    /// Whether to enforce MEV-protect payout checks.
+    #[serde(default)]
+    pub is_mev_protect: bool,
 }
 
 /// A Request to validate a [`SignedBidSubmissionV4`]
@@ -49,6 +59,9 @@ pub struct BuilderBlockValidationRequestV4 {
     pub parent_beacon_block_root: B256,
     #[serde(default)]
     pub transaction_filter: TransactionFilter,
+    /// Whether to enforce MEV-protect payout checks.
+    #[serde(default)]
+    pub is_mev_protect: bool,
 }
 
 /// A Request to validate a [`SignedBidSubmissionV5`]
@@ -66,6 +79,9 @@ pub struct BuilderBlockValidationRequestV5 {
     pub parent_beacon_block_root: B256,
     #[serde(default)]
     pub transaction_filter: TransactionFilter,
+    /// Whether to enforce MEV-protect payout checks.
+    #[serde(default)]
+    pub is_mev_protect: bool,
 }
 
 /// Block validation rpc interface.
