@@ -7,8 +7,6 @@ use alloy_eips::eip7685::RequestsOrHash;
 use alloy_primitives::{map::AddressSet, Address, B256, U256};
 use alloy_rpc_types_beacon::relay::{
     BidTrace, BuilderBlockValidationRequest, BuilderBlockValidationRequestV2,
-    BuilderBlockValidationRequestV3, BuilderBlockValidationRequestV4,
-    BuilderBlockValidationRequestV5, BuilderBlockValidationRequestV6,
 };
 use alloy_rpc_types_engine::{
     BlobsBundleV1, BlobsBundleV2, CancunPayloadFields, ExecutionData, ExecutionPayload,
@@ -36,7 +34,11 @@ use reth_primitives_traits::{
     SealedBlock, SealedHeaderFor,
 };
 use reth_revm::{cached::CachedReads, database::StateProviderDatabase};
-use reth_rpc_api::BlockSubmissionValidationApiServer;
+use reth_rpc_api::{
+    BlockSubmissionValidationApiServer, BuilderBlockValidationRequestV3,
+    BuilderBlockValidationRequestV4, BuilderBlockValidationRequestV5,
+    BuilderBlockValidationRequestV6, TransactionFilter,
+};
 use reth_rpc_server_types::result::{internal_rpc_err, invalid_params_rpc_err};
 use reth_storage_api::{
     BlockReaderIdExt, HashedPostStateProvider, StateProvider, StateProviderFactory,
@@ -160,6 +162,7 @@ where
         block: RecoveredBlock<<E::Primitives as NodePrimitives>::Block>,
         message: BidTrace,
         registered_gas_limit: u64,
+        transaction_filter: TransactionFilter,
         decoded_bal: Option<DecodedBal>,
     ) -> Result<(), ValidationApiError> {
         self.validate_message_against_header(block.sealed_header(), &message)?;
@@ -167,7 +170,7 @@ where
         self.consensus.validate_header(block.sealed_header())?;
         self.consensus.validate_block_pre_execution(block.sealed_block())?;
 
-        if !self.disallow.is_empty() {
+        if !self.disallow.is_empty() && transaction_filter != TransactionFilter::None {
             if self.disallow.contains(&block.beneficiary()) {
                 return Err(ValidationApiError::Blacklist(block.beneficiary()))
             }
@@ -454,6 +457,7 @@ where
             block,
             request.request.message,
             request.registered_gas_limit,
+            request.transaction_filter,
             None,
         )
         .await
@@ -483,6 +487,7 @@ where
             block,
             request.request.message,
             request.registered_gas_limit,
+            request.transaction_filter,
             None,
         )
         .await
@@ -528,6 +533,7 @@ where
             block,
             request.request.message,
             request.registered_gas_limit,
+            request.transaction_filter,
             None,
         )
         .await
@@ -576,6 +582,7 @@ where
             block,
             request.request.message,
             request.registered_gas_limit,
+            request.transaction_filter,
             Some(decoded_bal),
         )
         .await
@@ -838,8 +845,9 @@ pub(crate) struct ValidationMetrics {
 #[cfg(test)]
 mod tests {
     use super::{
-        hash_disallow_list, validate_message_against_payload, AddressSet, ValidationApi,
-        ValidationApiConfig, ValidationApiError,
+        hash_disallow_list, validate_message_against_payload, AddressSet,
+        BuilderBlockValidationRequestV6, TransactionFilter, ValidationApi, ValidationApiConfig,
+        ValidationApiError,
     };
     use alloy_consensus::{BlockHeader, Header};
     use alloy_eips::{
@@ -848,7 +856,7 @@ mod tests {
     };
     use alloy_primitives::{address, b256, hex, Address, Bytes, FixedBytes, B256, U256};
     use alloy_rpc_types_beacon::{
-        relay::{BidTrace, BuilderBlockValidationRequestV6, SignedBidSubmissionV6},
+        relay::{BidTrace, SignedBidSubmissionV6},
         requests::ExecutionRequestsV5,
     };
     use alloy_rpc_types_engine::{
@@ -979,6 +987,7 @@ mod tests {
             },
             registered_gas_limit: 30_000_000,
             parent_beacon_block_root: B256::ZERO,
+            transaction_filter: TransactionFilter::None,
         }
     }
 
@@ -1354,7 +1363,13 @@ mod tests {
         let registered_gas_limit = block.gas_limit();
 
         let err = test_validation_api(provider)
-            .validate_message_against_block(block, message, registered_gas_limit, None)
+            .validate_message_against_block(
+                block,
+                message,
+                registered_gas_limit,
+                TransactionFilter::None,
+                None,
+            )
             .await
             .unwrap_err();
 
@@ -1368,7 +1383,13 @@ mod tests {
         message.value = U256::ZERO;
 
         test_validation_api(provider)
-            .validate_message_against_block(block, message, registered_gas_limit, None)
+            .validate_message_against_block(
+                block,
+                message,
+                registered_gas_limit,
+                TransactionFilter::None,
+                None,
+            )
             .await
             .unwrap();
     }
