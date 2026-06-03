@@ -11,10 +11,11 @@ use serde_with::{serde_as, DisplayFromStr};
 
 // Ultra Sound custom types to support per request transaction filtering
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-#[allow(missing_docs)]
+#[allow(missing_docs, clippy::upper_case_acronyms)]
 pub enum TransactionFilter {
+    #[default]
     None,
     OFAC,
 }

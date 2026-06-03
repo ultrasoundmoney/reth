@@ -15,6 +15,28 @@ pre-build = [
     "apt-get update && apt-get install --assume-yes --no-install-recommends llvm-dev libclang-dev clang",
 ]
 
+# Override cross-rs default images for these targets so we get Ubuntu 24.04 (gcc 13)
+# rather than cross's stock Ubuntu 20.04 (gcc 9). The 0.40+ aws-lc-sys crate
+# refuses to build on gcc 9 due to a known memcmp codegen bug
+# (https://gcc.gnu.org/bugzilla/show_bug.cgi?id=95189).
+[target.x86_64-unknown-linux-gnu]
+image = "ubuntu:24.04"
+pre-build = [
+    "apt update",
+    "apt install --yes gcc g++ libclang-dev clang make pkg-config",
+]
+
+[target.aarch64-unknown-linux-gnu]
+image = "ubuntu:24.04"
+pre-build = [
+    "apt update",
+    "apt install --yes gcc gcc-aarch64-linux-gnu g++-aarch64-linux-gnu libclang-dev clang make pkg-config",
+]
+env.passthrough = [
+    "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc",
+    "CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++",
+]
+
 [target.riscv64gc-unknown-linux-gnu]
 image = "ubuntu:24.04"
 pre-build = [
