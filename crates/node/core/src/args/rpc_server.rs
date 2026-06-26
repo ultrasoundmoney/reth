@@ -4,7 +4,6 @@ use crate::args::{
     types::{MaxU32, ZeroAsNoneU64},
     GasPriceOracleArgs, RpcStateCacheArgs,
 };
-use alloy_primitives::map::AddressSet;
 use alloy_rpc_types_engine::JwtSecret;
 use clap::{
     builder::{PossibleValue, RangedU64ValueParser, Resettable, TypedValueParser},
@@ -88,7 +87,7 @@ pub struct DefaultRpcServerArgs {
     rpc_proof_permits: usize,
     rpc_pending_block: PendingBlockKind,
     rpc_forwarder: Option<Url>,
-    builder_disallow: Option<AddressSet>,
+    builder_disallow_url: Option<String>,
     rpc_state_cache: RpcStateCacheArgs,
     gas_price_oracle: GasPriceOracleArgs,
     rpc_send_raw_transaction_sync_timeout: Duration,
@@ -333,9 +332,9 @@ impl DefaultRpcServerArgs {
         self
     }
 
-    /// Set the default builder disallow addresses
-    pub fn with_builder_disallow(mut self, v: Option<AddressSet>) -> Self {
-        self.builder_disallow = v;
+    /// Set the default builder disallow list url
+    pub fn with_builder_disallow_url(mut self, v: Option<String>) -> Self {
+        self.builder_disallow_url = v;
         self
     }
 
@@ -399,7 +398,7 @@ impl Default for DefaultRpcServerArgs {
             rpc_proof_permits: constants::DEFAULT_PROOF_PERMITS,
             rpc_pending_block: PendingBlockKind::Full,
             rpc_forwarder: None,
-            builder_disallow: None,
+            builder_disallow_url: None,
             rpc_state_cache: RpcStateCacheArgs::default(),
             gas_price_oracle: GasPriceOracleArgs::default(),
             rpc_send_raw_transaction_sync_timeout:
@@ -619,10 +618,10 @@ pub struct RpcServerArgs {
     #[arg(long = "rpc.forwarder", alias = "rpc-forwarder", value_name = "FORWARDER")]
     pub rpc_forwarder: Option<Url>,
 
-    /// Path to file containing disallowed addresses, json-encoded list of strings. Block
-    /// validation API will reject blocks containing transactions from these addresses.
-    #[arg(long = "builder.disallow", value_name = "PATH", value_parser = reth_cli_util::parsers::read_json_from_file::<AddressSet>, default_value = Resettable::from(DefaultRpcServerArgs::get_global().builder_disallow.as_ref().map(|v| format!("{:?}", v).into())))]
-    pub builder_disallow: Option<AddressSet>,
+    /// URL to fetch the disallowed-address list from (json array of address strings). The block
+    /// validation API refreshes from it periodically; if unset, the disallow list is empty.
+    #[arg(long = "builder.disallow-url", value_name = "URL", default_value = Resettable::from(DefaultRpcServerArgs::get_global().builder_disallow_url.as_ref().map(|v| v.clone().into())))]
+    pub builder_disallow_url: Option<String>,
 
     /// State cache configuration.
     #[command(flatten)]
@@ -845,7 +844,7 @@ impl Default for RpcServerArgs {
             rpc_proof_permits,
             rpc_pending_block,
             rpc_forwarder,
-            builder_disallow,
+            builder_disallow_url,
             rpc_state_cache,
             gas_price_oracle,
             rpc_send_raw_transaction_sync_timeout,
@@ -889,7 +888,7 @@ impl Default for RpcServerArgs {
             rpc_proof_permits,
             rpc_pending_block,
             rpc_forwarder,
-            builder_disallow,
+            builder_disallow_url,
             rpc_state_cache,
             gas_price_oracle,
             rpc_send_raw_transaction_sync_timeout,
@@ -1055,7 +1054,7 @@ mod tests {
             rpc_proof_permits: 16,
             rpc_pending_block: PendingBlockKind::Full,
             rpc_forwarder: Some("http://localhost:8545".parse().unwrap()),
-            builder_disallow: None,
+            builder_disallow_url: None,
             rpc_state_cache: RpcStateCacheArgs {
                 max_blocks: 5000,
                 max_receipts: 2000,

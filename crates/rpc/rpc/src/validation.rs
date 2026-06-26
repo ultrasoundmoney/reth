@@ -71,25 +71,28 @@ where
     ) -> Self {
         let ValidationApiConfig { disallow, validation_window } = config;
 
+        let metrics = ValidationMetrics::default();
+        record_disallow_metrics(&metrics, &disallow);
+
         let inner = Arc::new(ValidationApiInner {
             provider,
             consensus,
             payload_validator,
             evm_config,
-            disallow,
+            disallow: std::sync::RwLock::new(Arc::new(disallow)),
             validation_window,
             cached_state: Default::default(),
             task_spawner,
-            metrics: Default::default(),
+            metrics,
         });
 
-        inner.metrics.disallow_size.set(inner.disallow.len() as f64);
-
-        let disallow_hash = hash_disallow_list(&inner.disallow);
-        let hash_gauge = gauge!("builder_validation_disallow_hash", "hash" => disallow_hash);
-        hash_gauge.set(1.0);
-
         Self { inner }
+    }
+
+    /// Replaces the disallow list (e.g. from a periodic refresh) and re-emits its metrics.
+    pub fn update_disallow(&self, disallow: AddressSet) {
+        record_disallow_metrics(&self.metrics, &disallow);
+        *self.disallow.write().expect("disallow lock poisoned") = Arc::new(disallow);
     }
 
     /// Returns the cached reads for the given head hash.
@@ -135,19 +138,21 @@ where
         self.consensus.validate_header(block.sealed_header())?;
         self.consensus.validate_block_pre_execution(block.sealed_block())?;
 
-        if !self.disallow.is_empty() && transaction_filter == TransactionFilter::OFAC {
-            if self.disallow.contains(&block.beneficiary()) {
+        let disallow = self.disallow.read().expect("disallow lock poisoned").clone();
+
+        if !disallow.is_empty() && transaction_filter == TransactionFilter::OFAC {
+            if disallow.contains(&block.beneficiary()) {
                 return Err(ValidationApiError::Blacklist(block.beneficiary()));
             }
-            if self.disallow.contains(&message.proposer_fee_recipient) {
+            if disallow.contains(&message.proposer_fee_recipient) {
                 return Err(ValidationApiError::Blacklist(message.proposer_fee_recipient));
             }
             for (sender, tx) in block.senders_iter().zip(block.body().transactions()) {
-                if self.disallow.contains(sender) {
+                if disallow.contains(sender) {
                     return Err(ValidationApiError::Blacklist(*sender));
                 }
                 if let Some(to) = tx.to()
-                    && self.disallow.contains(&to)
+                    && disallow.contains(&to)
                 {
                     return Err(ValidationApiError::Blacklist(to));
                 }
@@ -186,11 +191,11 @@ where
 
         let mut accessed_blacklisted = None;
         let output = executor.execute_with_state_closure(&block, |state| {
-            if !self.disallow.is_empty() && transaction_filter == TransactionFilter::OFAC {
+            if !disallow.is_empty() && transaction_filter == TransactionFilter::OFAC {
                 // Check whether the submission interacted with any blacklisted account by scanning
                 // the `State`'s cache that records everything read from database during execution.
                 for account in state.cache.accounts.keys() {
-                    if self.disallow.contains(account) {
+                    if disallow.contains(account) {
                         accessed_blacklisted = Some(*account);
                     }
                 }
@@ -573,8 +578,8 @@ pub struct ValidationApiInner<Provider, E: ConfigureEvm, T: PayloadTypes> {
         Arc<dyn PayloadValidator<T, Block = <E::Primitives as NodePrimitives>::Block>>,
     /// Block executor factory.
     evm_config: E,
-    /// Set of disallowed addresses
-    disallow: AddressSet,
+    /// Disallowed addresses, swappable so a periodic refresh can update them without a restart.
+    disallow: std::sync::RwLock<Arc<AddressSet>>,
     /// The maximum block distance - parent to latest - allowed for validation
     validation_window: u64,
     /// Cached state reads to avoid redundant disk I/O across multiple validation attempts
@@ -602,6 +607,15 @@ fn hash_disallow_list(disallow: &AddressSet) -> String {
     }
 
     format!("{:x}", hasher.finalize())
+}
+
+/// Sets the disallow-list size and hash gauges from the given set.
+fn record_disallow_metrics(metrics: &ValidationMetrics, disallow: &AddressSet) {
+    metrics.disallow_size.set(disallow.len() as f64);
+
+    let disallow_hash = hash_disallow_list(disallow);
+    let hash_gauge = gauge!("builder_validation_disallow_hash", "hash" => disallow_hash);
+    hash_gauge.set(1.0);
 }
 
 impl<Provider, E: ConfigureEvm, T: PayloadTypes> fmt::Debug for ValidationApiInner<Provider, E, T> {
