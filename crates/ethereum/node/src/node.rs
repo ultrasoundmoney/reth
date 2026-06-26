@@ -50,13 +50,46 @@ use reth_rpc_eth_api::{
 };
 use reth_rpc_eth_types::{error::FromEvmError, EthApiError};
 use reth_rpc_server_types::RethRpcModule;
-use reth_tracing::tracing::{debug, info};
+use reth_tracing::tracing::{debug, info, warn};
 use reth_transaction_pool::{
     blobstore::DiskFileBlobStore, EthTransactionPool, PoolPooledTx, PoolTransaction,
     TransactionPool, TransactionValidationTaskExecutor,
 };
 use revm::context::TxEnv;
-use std::{marker::PhantomData, sync::Arc, time::SystemTime};
+use std::{
+    marker::PhantomData,
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
+use alloy_primitives::map::AddressSet;
+
+/// How often a running node re-fetches the builder disallow list from its url.
+const DISALLOW_REFRESH_INTERVAL: Duration = Duration::from_secs(300);
+
+/// Fetches and parses the disallow list (json array of address strings) from `url`.
+async fn fetch_disallow(client: &reqwest::Client, url: &str) -> eyre::Result<AddressSet> {
+    let body = client.get(url).send().await?.error_for_status()?.text().await?;
+    Ok(serde_json::from_str(&body)?)
+}
+
+/// Fetches the disallow list at startup, retrying a few times, then exits the process if it
+/// cannot be loaded — a sim node must never run without its sanctions list.
+async fn fetch_disallow_or_exit(url: &str) -> AddressSet {
+    let client = reqwest::Client::new();
+    for attempt in 1..=5u32 {
+        match fetch_disallow(&client, url).await {
+            Ok(disallow) => {
+                info!(target: "reth::cli", count = disallow.len(), %url, "loaded builder disallow list");
+                return disallow;
+            }
+            Err(error) => {
+                warn!(target: "reth::cli", attempt, %url, %error, "failed to fetch builder disallow list at startup");
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        }
+    }
+    panic!("could not fetch builder disallow list from {url} after 5 attempts; refusing to start");
+}
 
 /// Type configuration for a regular Ethereum node.
 #[derive(Debug, Default, Clone, Copy)]
@@ -322,14 +355,41 @@ where
         self,
         ctx: reth_node_api::AddOnsContext<'_, N>,
     ) -> eyre::Result<Self::Handle> {
+        let disallow_url = ctx.config.rpc.builder_disallow_url.clone();
+
+        let mut flashbots_config = ctx.config.rpc.flashbots_config();
+        if let Some(url) = &disallow_url {
+            flashbots_config.disallow = fetch_disallow_or_exit(url).await;
+        }
+
         let validation_api = ValidationApi::<_, _, <N::Types as NodeTypes>::Payload>::new(
             ctx.node.provider().clone(),
             Arc::new(ctx.node.consensus().clone()),
             ctx.node.evm_config().clone(),
-            ctx.config.rpc.flashbots_config(),
+            flashbots_config,
             ctx.node.task_executor().clone(),
             Arc::new(EthereumEngineValidator::new(ctx.config.chain.clone())),
         );
+
+        if let Some(url) = disallow_url {
+            let validation_api = validation_api.clone();
+            let client = reqwest::Client::new();
+            ctx.node.task_executor().spawn_task(async move {
+                let mut ticker = tokio::time::interval(DISALLOW_REFRESH_INTERVAL);
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                ticker.tick().await;
+                loop {
+                    ticker.tick().await;
+                    match fetch_disallow(&client, &url).await {
+                        Ok(disallow) => validation_api.update_disallow(disallow),
+                        Err(error) => warn!(
+                            target: "reth::cli", %url, %error,
+                            "failed to refresh builder disallow list, keeping last-good"
+                        ),
+                    }
+                }
+            });
+        }
 
         let eth_config =
             EthConfigHandler::new(ctx.node.provider().clone(), ctx.node.evm_config().clone());

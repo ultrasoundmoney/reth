@@ -9216,6 +9216,7 @@ dependencies = [
  "futures",
  "jsonrpsee-core",
  "rand 0.9.4",
+ "reqwest 0.13.2",
  "reth-chainspec",
  "reth-db",
  "reth-e2e-test-utils",
