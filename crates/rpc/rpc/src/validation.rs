@@ -173,9 +173,10 @@ where
         self.consensus.validate_header(block.sealed_header())?;
         self.consensus.validate_block_pre_execution(block.sealed_block())?;
 
-        let disallow = self.disallow.read().clone();
+        let disallow =
+            (transaction_filter == TransactionFilter::OFAC).then(|| self.disallow.read().clone());
 
-        if !disallow.is_empty() && transaction_filter == TransactionFilter::OFAC {
+        if let Some(disallow) = &disallow {
             if disallow.contains(&block.beneficiary()) {
                 return Err(ValidationApiError::Blacklist(block.beneficiary()))
             }
@@ -252,7 +253,7 @@ where
                 executor.take_bal().map(|bal| compute_block_access_list_hash(&bal));
 
             let mut state = executor.into_state();
-            if !disallow.is_empty() && transaction_filter == TransactionFilter::OFAC {
+            if let Some(disallow) = &disallow {
                 // Check whether the submission interacted with any blacklisted account by
                 // scanning the `State`'s cache that records everything read from database
                 // during execution.
