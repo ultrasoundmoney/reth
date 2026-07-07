@@ -79,7 +79,7 @@ where
             consensus,
             payload_validator,
             evm_config,
-            disallow: std::sync::RwLock::new(Arc::new(disallow)),
+            disallow: parking_lot::RwLock::new(Arc::new(disallow)),
             validation_window,
             cached_state: Default::default(),
             task_spawner,
@@ -92,7 +92,7 @@ where
     /// Replaces the disallow list (e.g. from a periodic refresh) and re-emits its metrics.
     pub fn update_disallow(&self, disallow: AddressSet) {
         record_disallow_metrics(&self.metrics, &disallow);
-        *self.disallow.write().expect("disallow lock poisoned") = Arc::new(disallow);
+        *self.disallow.write() = Arc::new(disallow);
     }
 
     /// Returns the cached reads for the given head hash.
@@ -138,7 +138,7 @@ where
         self.consensus.validate_header(block.sealed_header())?;
         self.consensus.validate_block_pre_execution(block.sealed_block())?;
 
-        let disallow = self.disallow.read().expect("disallow lock poisoned").clone();
+        let disallow = self.disallow.read().clone();
 
         if !disallow.is_empty() && transaction_filter == TransactionFilter::OFAC {
             if disallow.contains(&block.beneficiary()) {
@@ -579,7 +579,7 @@ pub struct ValidationApiInner<Provider, E: ConfigureEvm, T: PayloadTypes> {
     /// Block executor factory.
     evm_config: E,
     /// Disallowed addresses, swappable so a periodic refresh can update them without a restart.
-    disallow: std::sync::RwLock<Arc<AddressSet>>,
+    disallow: parking_lot::RwLock<Arc<AddressSet>>,
     /// The maximum block distance - parent to latest - allowed for validation
     validation_window: u64,
     /// Cached state reads to avoid redundant disk I/O across multiple validation attempts
