@@ -44,17 +44,32 @@ use reth_tasks::TaskSpawner;
 use revm_primitives::{address, b256, Address, B256, U256};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use tokio::sync::{oneshot, RwLock};
 use tracing::warn;
 
-/// Titan's `PaymentForwarder`, deployed at the same address on every chain via the
-/// deterministic-deployment proxy. It `SELFDESTRUCT`s its balance to the recipient, so the
-/// payment reverts unless it lands in the block it was built for - which stops a payment
-/// exposed by a missed slot from being replayed later.
+/// Canonical `PaymentForwarder` deployment, identical on every chain that has it.
+const DEFAULT_PAYMENT_FORWARDER: Address = address!("0xFEEEEEE44046c3f61a8CC081E0918eF0de0a7ffC");
+
+/// Environment variable overriding [`PAYMENT_FORWARDER`], for chains where the forwarder was
+/// deployed under a different salt.
+const PAYMENT_FORWARDER_VAR: &str = "PAYMENT_FORWARDER_ADDRESS";
+
+/// Titan's `PaymentForwarder`. It `SELFDESTRUCT`s its balance to the recipient, so the payment
+/// reverts unless it lands in the block it was built for - which stops a payment exposed by a
+/// missed slot from being replayed later.
+///
+/// Only the address is configurable; [`PAYMENT_FORWARDER_CODE_HASH`] is not, so pointing this
+/// at the wrong address fails closed rather than trusting whatever lives there.
 ///
 /// <https://github.com/gattaca-com/helix/pull/466>
-pub const PAYMENT_FORWARDER: Address = address!("0xFEEEEEE44046c3f61a8CC081E0918eF0de0a7ffC");
+pub static PAYMENT_FORWARDER: LazyLock<Address> =
+    LazyLock::new(|| match std::env::var(PAYMENT_FORWARDER_VAR) {
+        Ok(value) => value
+            .parse()
+            .unwrap_or_else(|_| panic!("{PAYMENT_FORWARDER_VAR} is not a valid address: {value}")),
+        Err(_) => DEFAULT_PAYMENT_FORWARDER,
+    });
 
 /// Calldata of a `PaymentForwarder` payment: a 4-byte big-endian timestamp followed by the
 /// 20-byte recipient.
@@ -403,9 +418,9 @@ where
         // calldata.
         let paid_directly =
             tx.to() == Some(message.proposer_fee_recipient) && tx.input().is_empty();
-        let paid_via_forwarder = tx.to() == Some(PAYMENT_FORWARDER)
+        let paid_via_forwarder = tx.to() == Some(*PAYMENT_FORWARDER)
             && payment_forwarder_recipient(tx.input()) == Some(message.proposer_fee_recipient)
-            && output.state.state.get(&PAYMENT_FORWARDER).is_some_and(|account| {
+            && output.state.state.get(&*PAYMENT_FORWARDER).is_some_and(|account| {
                 account
                     .info
                     .as_ref()
@@ -833,7 +848,8 @@ pub(crate) struct ValidationMetrics {
 mod tests {
     use super::{
         hash_disallow_list, mev_ratio_bps, payment_forwarder_recipient, AddressSet,
-        PAYMENT_FORWARDER_CALLDATA_LEN, PAYMENT_FORWARDER_CODE_HASH,
+        DEFAULT_PAYMENT_FORWARDER, PAYMENT_FORWARDER, PAYMENT_FORWARDER_CALLDATA_LEN,
+        PAYMENT_FORWARDER_CODE_HASH,
     };
     use alloy_primitives::keccak256;
     use revm_primitives::{Address, U256};
@@ -844,6 +860,13 @@ mod tests {
         let mut input = timestamp.to_be_bytes().to_vec();
         input.extend_from_slice(recipient.as_slice());
         input
+    }
+
+    /// The address may be overridden per chain, but the code never is - that is what makes a
+    /// wrong or empty address fail closed.
+    #[test]
+    fn payment_forwarder_defaults_to_the_canonical_deployment() {
+        assert_eq!(*PAYMENT_FORWARDER, DEFAULT_PAYMENT_FORWARDER);
     }
 
     /// Deployed runtime of the forwarder, from gattaca-com/helix#466. If this stops matching,
