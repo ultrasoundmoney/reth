@@ -42,31 +42,71 @@ use reth_tasks::Runtime;
 use revm_primitives::{address, b256, Address, B256, U256};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::sync::{Arc, LazyLock};
+use std::{
+    collections::HashMap,
+    sync::{Arc, LazyLock},
+};
 use tokio::sync::{oneshot, RwLock};
 use tracing::warn;
 
-const DEFAULT_PAYMENT_FORWARDER: Address = address!("0xFEEEEEE44046c3f61a8CC081E0918eF0de0a7ffC");
+/// <https://github.com/gattaca-com/helix/pull/466>.
+const DEFAULT_PAYMENT_FORWARDERS: [(Address, B256); 1] = [(
+    address!("0xFEEEEEE44046c3f61a8CC081E0918eF0de0a7ffC"),
+    b256!("0xd9f5db49d3c0a174c39701485406cd78d01dd27f73b7ef7b883e5f69d8103220"),
+)];
 
-const PAYMENT_FORWARDER_VAR: &str = "PAYMENT_FORWARDER_ADDRESS";
+const PAYMENT_FORWARDERS_VAR: &str = "PAYMENT_FORWARDERS";
 
-/// <https://github.com/gattaca-com/helix/pull/466>. Overridable per chain; the code hash is
-/// not, so a wrong address fails closed.
-pub static PAYMENT_FORWARDER: LazyLock<Address> =
-    LazyLock::new(|| match std::env::var(PAYMENT_FORWARDER_VAR) {
-        Ok(value) => value
-            .parse()
-            .unwrap_or_else(|_| panic!("{PAYMENT_FORWARDER_VAR} is not a valid address: {value}")),
-        Err(_) => DEFAULT_PAYMENT_FORWARDER,
-    });
+/// Accepted forwarders, as comma-separated `address:code_hash` pairs.
+///
+/// A list rather than one entry so a redeployment can be accepted alongside the old contract,
+/// instead of needing a flag day where one of the two is rejected.
+///
+/// The code hash is part of the entry and never inferred from the chain: a value call to a
+/// codeless address succeeds and keeps the value, so an address on its own would validate a
+/// payment the recipient never received.
+pub(crate) static PAYMENT_FORWARDERS: LazyLock<HashMap<Address, B256>> = LazyLock::new(|| {
+    match std::env::var(PAYMENT_FORWARDERS_VAR) {
+        Ok(value) => parse_payment_forwarders(&value)
+            .unwrap_or_else(|error| panic!("{PAYMENT_FORWARDERS_VAR} is invalid: {error}")),
+        Err(_) => DEFAULT_PAYMENT_FORWARDERS.into_iter().collect(),
+    }
+});
+
+/// Rejects an empty list: disabling forwarder payments is not a configuration we want to reach
+/// by accident, and a typo that parsed to nothing would silently demote every builder using one.
+fn parse_payment_forwarders(value: &str) -> Result<HashMap<Address, B256>, String> {
+    let forwarders = value
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| {
+            let (address, code_hash) = entry
+                .split_once(':')
+                .ok_or_else(|| format!("expected `address:code_hash`, got `{entry}`"))?;
+
+            Ok((
+                address
+                    .trim()
+                    .parse::<Address>()
+                    .map_err(|_| format!("invalid address `{address}`"))?,
+                code_hash
+                    .trim()
+                    .parse::<B256>()
+                    .map_err(|_| format!("invalid code hash `{code_hash}`"))?,
+            ))
+        })
+        .collect::<Result<HashMap<_, _>, String>>()?;
+
+    if forwarders.is_empty() {
+        return Err("no forwarders configured".to_string());
+    }
+
+    Ok(forwarders)
+}
 
 /// `[4-byte timestamp][20-byte recipient]`
 const PAYMENT_FORWARDER_CALLDATA_LEN: usize = 24;
-
-/// A value call to a codeless address succeeds and keeps the value, so without this a payment
-/// would validate on a chain lacking the forwarder while the recipient received nothing.
-const PAYMENT_FORWARDER_CODE_HASH: B256 =
-    b256!("0xd9f5db49d3c0a174c39701485406cd78d01dd27f73b7ef7b883e5f69d8103220");
 
 /// Trailing bytes are inert: the contract reads one calldata word and forwards nothing. Shorter
 /// input would zero-pad the recipient and burn the value, so it is rejected.
@@ -362,14 +402,17 @@ where
 
         let paid_directly =
             tx.to() == Some(message.proposer_fee_recipient) && tx.input().is_empty();
-        let paid_via_forwarder = tx.to() == Some(*PAYMENT_FORWARDER)
-            && payment_forwarder_recipient(tx.input()) == Some(message.proposer_fee_recipient)
-            && output.state.state.get(&*PAYMENT_FORWARDER).is_some_and(|account| {
-                account
-                    .info
-                    .as_ref()
-                    .is_some_and(|info| info.code_hash == PAYMENT_FORWARDER_CODE_HASH)
-            });
+        let paid_via_forwarder = tx.to().is_some_and(|to| {
+            PAYMENT_FORWARDERS.get(&to).is_some_and(|code_hash| {
+                payment_forwarder_recipient(tx.input()) == Some(message.proposer_fee_recipient)
+                    && output.state.state.get(&to).is_some_and(|account| {
+                        account
+                            .info
+                            .as_ref()
+                            .is_some_and(|info| info.code_hash == *code_hash)
+                    })
+            })
+        });
 
         if !paid_directly && !paid_via_forwarder {
             return Err(ValidationApiError::ProposerPayment);
@@ -758,11 +801,12 @@ pub(crate) struct ValidationMetrics {
 #[cfg(test)]
 mod tests {
     use super::{
-        hash_disallow_list, payment_forwarder_recipient, AddressSet, DEFAULT_PAYMENT_FORWARDER,
-        PAYMENT_FORWARDER, PAYMENT_FORWARDER_CALLDATA_LEN, PAYMENT_FORWARDER_CODE_HASH,
+        hash_disallow_list, parse_payment_forwarders, payment_forwarder_recipient, AddressSet,
+        DEFAULT_PAYMENT_FORWARDERS, PAYMENT_FORWARDERS, PAYMENT_FORWARDER_CALLDATA_LEN,
     };
     use alloy_primitives::keccak256;
-    use revm_primitives::Address;
+    use revm_primitives::{Address, B256};
+    use std::collections::HashMap;
 
     /// 4-byte big-endian timestamp followed by the 20-byte recipient.
     fn forwarder_calldata(recipient: Address, timestamp: u32) -> Vec<u8> {
@@ -772,16 +816,55 @@ mod tests {
     }
 
     #[test]
-    fn payment_forwarder_defaults_to_the_canonical_deployment() {
-        assert_eq!(*PAYMENT_FORWARDER, DEFAULT_PAYMENT_FORWARDER);
+    fn payment_forwarders_default_to_the_canonical_deployment() {
+        let expected: HashMap<Address, B256> = DEFAULT_PAYMENT_FORWARDERS.into_iter().collect();
+
+        assert_eq!(*PAYMENT_FORWARDERS, expected);
     }
 
     /// If this stops matching, the contract changed and its address changed with it.
     #[test]
     fn payment_forwarder_code_hash_matches_the_deployed_runtime() {
         let runtime = alloy_primitives::hex!("5f358060e01c4218600f5760401cff5b5f5ffd00");
+        let (_, code_hash) = DEFAULT_PAYMENT_FORWARDERS[0];
 
-        assert_eq!(keccak256(runtime), PAYMENT_FORWARDER_CODE_HASH);
+        assert_eq!(keccak256(runtime), code_hash);
+    }
+
+    /// The migration case: both deployments accepted at once, each pinned to its own code hash.
+    #[test]
+    fn parse_payment_forwarders_reads_several_pairs() {
+        let old = Address::from([1u8; 20]);
+        let new = Address::from([2u8; 20]);
+        let old_hash = B256::from([3u8; 32]);
+        let new_hash = B256::from([4u8; 32]);
+
+        let parsed =
+            parse_payment_forwarders(&format!(" {old}:{old_hash} , {new}:{new_hash} ")).unwrap();
+
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed.get(&old), Some(&old_hash));
+        assert_eq!(parsed.get(&new), Some(&new_hash));
+    }
+
+    /// A typo must not silently parse to a list that accepts nothing - that would demote every
+    /// builder paying through a forwarder.
+    #[test]
+    fn parse_payment_forwarders_rejects_malformed_input() {
+        let address = Address::from([1u8; 20]);
+        let hash = B256::from([3u8; 32]);
+
+        for input in [
+            String::new(),
+            "  ,  ".to_string(),
+            format!("{address}"),
+            format!("{address}:"),
+            format!(":{hash}"),
+            format!("{address}:0xnothex"),
+            format!("notanaddress:{hash}"),
+        ] {
+            assert!(parse_payment_forwarders(&input).is_err(), "accepted `{input}`");
+        }
     }
 
     #[test]
