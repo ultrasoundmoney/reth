@@ -115,6 +115,23 @@ fn payment_forwarder_recipient(input: &[u8]) -> Option<Address> {
         .then(|| Address::from_slice(&input[4..PAYMENT_FORWARDER_CALLDATA_LEN]))
 }
 
+/// Whether a payment to `to` forwards `value` on to `fee_recipient`.
+///
+/// `code_hash` is the hash of the account at `to` after execution, or `None` if the block left
+/// it untouched. It is compared against the hash configured for *that* forwarder, so an entry
+/// can never vouch for a different one's bytecode.
+fn is_forwarder_payment(
+    forwarders: &HashMap<Address, B256>,
+    to: Address,
+    input: &[u8],
+    fee_recipient: Address,
+    code_hash: Option<B256>,
+) -> bool {
+    forwarders.get(&to).is_some_and(|expected| {
+        payment_forwarder_recipient(input) == Some(fee_recipient) && code_hash == Some(*expected)
+    })
+}
+
 /// The type that implements the `validation` rpc namespace trait
 #[derive(Clone, Debug, derive_more::Deref)]
 pub struct ValidationApi<Provider, E: ConfigureEvm, T: PayloadTypes> {
@@ -403,15 +420,18 @@ where
         let paid_directly =
             tx.to() == Some(message.proposer_fee_recipient) && tx.input().is_empty();
         let paid_via_forwarder = tx.to().is_some_and(|to| {
-            PAYMENT_FORWARDERS.get(&to).is_some_and(|code_hash| {
-                payment_forwarder_recipient(tx.input()) == Some(message.proposer_fee_recipient)
-                    && output.state.state.get(&to).is_some_and(|account| {
-                        account
-                            .info
-                            .as_ref()
-                            .is_some_and(|info| info.code_hash == *code_hash)
-                    })
-            })
+            is_forwarder_payment(
+                &PAYMENT_FORWARDERS,
+                to,
+                tx.input(),
+                message.proposer_fee_recipient,
+                output
+                    .state
+                    .state
+                    .get(&to)
+                    .and_then(|account| account.info.as_ref())
+                    .map(|info| info.code_hash),
+            )
         });
 
         if !paid_directly && !paid_via_forwarder {
@@ -801,7 +821,8 @@ pub(crate) struct ValidationMetrics {
 #[cfg(test)]
 mod tests {
     use super::{
-        hash_disallow_list, parse_payment_forwarders, payment_forwarder_recipient, AddressSet,
+        hash_disallow_list, is_forwarder_payment, parse_payment_forwarders,
+        payment_forwarder_recipient, AddressSet,
         DEFAULT_PAYMENT_FORWARDERS, PAYMENT_FORWARDERS, PAYMENT_FORWARDER_CALLDATA_LEN,
     };
     use alloy_primitives::keccak256;
@@ -845,6 +866,131 @@ mod tests {
         assert_eq!(parsed.len(), 2);
         assert_eq!(parsed.get(&old), Some(&old_hash));
         assert_eq!(parsed.get(&new), Some(&new_hash));
+    }
+
+    const FEE_RECIPIENT: Address = Address::repeat_byte(7);
+    const FORWARDER_A: Address = Address::repeat_byte(1);
+    const FORWARDER_B: Address = Address::repeat_byte(2);
+    const HASH_A: B256 = B256::repeat_byte(0xAA);
+    const HASH_B: B256 = B256::repeat_byte(0xBB);
+
+    fn two_forwarders() -> HashMap<Address, B256> {
+        HashMap::from([(FORWARDER_A, HASH_A), (FORWARDER_B, HASH_B)])
+    }
+
+    fn calldata_for(recipient: Address) -> Vec<u8> {
+        forwarder_calldata(recipient, 1_760_000_000)
+    }
+
+    #[test]
+    fn forwarder_payment_is_accepted() {
+        assert!(is_forwarder_payment(
+            &two_forwarders(),
+            FORWARDER_A,
+            &calldata_for(FEE_RECIPIENT),
+            FEE_RECIPIENT,
+            Some(HASH_A),
+        ));
+    }
+
+    /// The property a single shared constant could not express: each entry vouches only for its
+    /// own bytecode. Swapping the hashes must not validate either one.
+    #[test]
+    fn a_forwarder_is_not_validated_by_another_entrys_code_hash() {
+        let forwarders = two_forwarders();
+
+        assert!(!is_forwarder_payment(
+            &forwarders,
+            FORWARDER_A,
+            &calldata_for(FEE_RECIPIENT),
+            FEE_RECIPIENT,
+            Some(HASH_B),
+        ));
+        assert!(!is_forwarder_payment(
+            &forwarders,
+            FORWARDER_B,
+            &calldata_for(FEE_RECIPIENT),
+            FEE_RECIPIENT,
+            Some(HASH_A),
+        ));
+    }
+
+    /// Both deployments accepted at once - the reason this is a list.
+    #[test]
+    fn both_listed_forwarders_are_accepted_with_their_own_hashes() {
+        let forwarders = two_forwarders();
+
+        for (forwarder, hash) in [(FORWARDER_A, HASH_A), (FORWARDER_B, HASH_B)] {
+            assert!(
+                is_forwarder_payment(
+                    &forwarders,
+                    forwarder,
+                    &calldata_for(FEE_RECIPIENT),
+                    FEE_RECIPIENT,
+                    Some(hash),
+                ),
+                "rejected {forwarder}"
+            );
+        }
+    }
+
+    /// A value call to an address with no code succeeds and keeps the value, so an untouched or
+    /// codeless account must never satisfy the payment.
+    #[test]
+    fn forwarder_payment_without_the_expected_code_is_rejected() {
+        let forwarders = two_forwarders();
+
+        for code_hash in [None, Some(B256::ZERO), Some(B256::repeat_byte(0xCD))] {
+            assert!(
+                !is_forwarder_payment(
+                    &forwarders,
+                    FORWARDER_A,
+                    &calldata_for(FEE_RECIPIENT),
+                    FEE_RECIPIENT,
+                    code_hash,
+                ),
+                "accepted code hash {code_hash:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn payment_to_an_unlisted_address_is_rejected() {
+        assert!(!is_forwarder_payment(
+            &two_forwarders(),
+            Address::repeat_byte(9),
+            &calldata_for(FEE_RECIPIENT),
+            FEE_RECIPIENT,
+            Some(HASH_A),
+        ));
+    }
+
+    #[test]
+    fn forwarder_payment_naming_another_recipient_is_rejected() {
+        assert!(!is_forwarder_payment(
+            &two_forwarders(),
+            FORWARDER_A,
+            &calldata_for(Address::repeat_byte(9)),
+            FEE_RECIPIENT,
+            Some(HASH_A),
+        ));
+    }
+
+    /// Short calldata zero-pads the recipient and burns the value, so it must not be treated as
+    /// a payment even though the contract itself would accept the call.
+    #[test]
+    fn forwarder_payment_with_short_calldata_is_rejected() {
+        let forwarders = two_forwarders();
+
+        for len in 0..PAYMENT_FORWARDER_CALLDATA_LEN {
+            let mut input = calldata_for(FEE_RECIPIENT);
+            input.truncate(len);
+
+            assert!(
+                !is_forwarder_payment(&forwarders, FORWARDER_A, &input, FEE_RECIPIENT, Some(HASH_A)),
+                "accepted {len} bytes"
+            );
+        }
     }
 
     /// A typo must not silently parse to a list that accepts nothing - that would demote every
