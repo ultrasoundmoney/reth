@@ -41,12 +41,44 @@ use reth_storage_api::{
     BlockReaderIdExt, HashedPostStateProvider, StateProviderFactory, StateRootProvider,
 };
 use reth_tasks::TaskSpawner;
-use revm_primitives::{Address, B256, U256};
+use revm_primitives::{address, b256, Address, B256, U256};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use tokio::sync::{oneshot, RwLock};
 use tracing::warn;
+
+/// Titan's `PaymentForwarder`, deployed at the same address on every chain via the
+/// deterministic-deployment proxy. It `SELFDESTRUCT`s its balance to the recipient, so the
+/// payment reverts unless it lands in the block it was built for - which stops a payment
+/// exposed by a missed slot from being replayed later.
+///
+/// <https://github.com/gattaca-com/helix/pull/466>
+pub const PAYMENT_FORWARDER: Address = address!("0xFEEEEEE44046c3f61a8CC081E0918eF0de0a7ffC");
+
+/// Calldata of a `PaymentForwarder` payment: a 4-byte big-endian timestamp followed by the
+/// 20-byte recipient.
+const PAYMENT_FORWARDER_CALLDATA_LEN: usize = 24;
+
+/// keccak256 of the runtime deployed at [`PAYMENT_FORWARDER`].
+///
+/// A value-bearing call to an address with no code succeeds and simply credits that address,
+/// so without this the payment would validate on a chain where the forwarder is not deployed
+/// while the fee recipient received nothing.
+const PAYMENT_FORWARDER_CODE_HASH: B256 =
+    b256!("0xd9f5db49d3c0a174c39701485406cd78d01dd27f73b7ef7b883e5f69d8103220");
+
+/// Recipient encoded in a [`PAYMENT_FORWARDER`] payment, or `None` if `input` is too short to
+/// be one.
+///
+/// Trailing bytes are permitted, matching the contract: it reads one calldata word and
+/// discards everything below the recipient, and nothing is forwarded on, so extra bytes are
+/// inert. Anything shorter than the payload would have the recipient zero-padded, which sends
+/// the balance to the zero address.
+fn payment_forwarder_recipient(input: &[u8]) -> Option<Address> {
+    (input.len() >= PAYMENT_FORWARDER_CALLDATA_LEN)
+        .then(|| Address::from_slice(&input[4..PAYMENT_FORWARDER_CALLDATA_LEN]))
+}
 
 /// Computes the ratio `proposer_paid` / (`proposer_paid` + `coinbase_delta`) in basis points
 /// (x100 of percent). Returns `None` if the denominator is zero.
@@ -366,15 +398,25 @@ where
             return Err(ValidationApiError::ProposerPayment);
         }
 
-        if tx.to() != Some(message.proposer_fee_recipient) {
+        // Either a plain transfer to the fee recipient, or one routed through the
+        // PaymentForwarder, which sends the whole value on to the recipient named in its
+        // calldata.
+        let paid_directly =
+            tx.to() == Some(message.proposer_fee_recipient) && tx.input().is_empty();
+        let paid_via_forwarder = tx.to() == Some(PAYMENT_FORWARDER)
+            && payment_forwarder_recipient(tx.input()) == Some(message.proposer_fee_recipient)
+            && output.state.state.get(&PAYMENT_FORWARDER).is_some_and(|account| {
+                account
+                    .info
+                    .as_ref()
+                    .is_some_and(|info| info.code_hash == PAYMENT_FORWARDER_CODE_HASH)
+            });
+
+        if !paid_directly && !paid_via_forwarder {
             return Err(ValidationApiError::ProposerPayment);
         }
 
         if tx.value() != message.value {
-            return Err(ValidationApiError::ProposerPayment);
-        }
-
-        if !tx.input().is_empty() {
             return Err(ValidationApiError::ProposerPayment);
         }
 
@@ -789,9 +831,82 @@ pub(crate) struct ValidationMetrics {
 
 #[cfg(test)]
 mod tests {
-    use super::{hash_disallow_list, mev_ratio_bps, AddressSet};
+    use super::{
+        hash_disallow_list, mev_ratio_bps, payment_forwarder_recipient, AddressSet,
+        PAYMENT_FORWARDER_CALLDATA_LEN, PAYMENT_FORWARDER_CODE_HASH,
+    };
+    use alloy_primitives::keccak256;
     use revm_primitives::{Address, U256};
     use std::collections::HashSet;
+
+    /// 4-byte big-endian timestamp followed by the 20-byte recipient.
+    fn forwarder_calldata(recipient: Address, timestamp: u32) -> Vec<u8> {
+        let mut input = timestamp.to_be_bytes().to_vec();
+        input.extend_from_slice(recipient.as_slice());
+        input
+    }
+
+    /// Deployed runtime of the forwarder, from gattaca-com/helix#466. If this stops matching,
+    /// the contract changed and the address will have changed with it.
+    #[test]
+    fn payment_forwarder_code_hash_matches_the_deployed_runtime() {
+        let runtime = alloy_primitives::hex!("5f358060e01c4218600f5760401cff5b5f5ffd00");
+
+        assert_eq!(keccak256(runtime), PAYMENT_FORWARDER_CODE_HASH);
+    }
+
+    #[test]
+    fn payment_forwarder_recipient_reads_the_encoded_address() {
+        let recipient = Address::from([7u8; 20]);
+        let input = forwarder_calldata(recipient, 1_760_000_000);
+
+        assert_eq!(input.len(), PAYMENT_FORWARDER_CALLDATA_LEN);
+        assert_eq!(payment_forwarder_recipient(&input), Some(recipient));
+    }
+
+    #[test]
+    fn payment_forwarder_recipient_rejects_short_calldata() {
+        let recipient = Address::from([7u8; 20]);
+
+        for len in 0..PAYMENT_FORWARDER_CALLDATA_LEN {
+            let mut input = forwarder_calldata(recipient, 1_760_000_000);
+            input.truncate(len);
+
+            assert_eq!(payment_forwarder_recipient(&input), None, "accepted {len} bytes");
+        }
+    }
+
+    /// The contract reads a single calldata word and forwards nothing, so trailing bytes
+    /// cannot change where the value lands. They must not change what we parse either.
+    #[test]
+    fn payment_forwarder_recipient_ignores_trailing_calldata() {
+        let recipient = Address::from([7u8; 20]);
+
+        for extra in 1..=64usize {
+            let mut input = forwarder_calldata(recipient, 1_760_000_000);
+            input.extend(std::iter::repeat_n(0xABu8, extra));
+
+            assert_eq!(
+                payment_forwarder_recipient(&input),
+                Some(recipient),
+                "misparsed with {extra} trailing bytes"
+            );
+        }
+    }
+
+    /// The timestamp is enforced by the forwarder itself, which reverts on a mismatch, and a
+    /// reverted payment is caught by the receipt-status check. Parsing must not depend on it.
+    #[test]
+    fn payment_forwarder_recipient_ignores_the_timestamp_value() {
+        let recipient = Address::from([7u8; 20]);
+
+        for timestamp in [0u32, 1, 1_760_000_000, u32::MAX] {
+            assert_eq!(
+                payment_forwarder_recipient(&forwarder_calldata(recipient, timestamp)),
+                Some(recipient)
+            );
+        }
+    }
 
     #[test]
     fn test_hash_disallow_list_deterministic() {
