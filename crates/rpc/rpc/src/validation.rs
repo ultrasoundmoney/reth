@@ -39,12 +39,41 @@ use reth_rpc_api::{
 use reth_rpc_server_types::result::{internal_rpc_err, invalid_params_rpc_err};
 use reth_storage_api::{BlockReaderIdExt, StateProviderFactory};
 use reth_tasks::Runtime;
-use revm_primitives::{Address, B256, U256};
+use revm_primitives::{address, b256, Address, B256, U256};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use tokio::sync::{oneshot, RwLock};
 use tracing::warn;
+
+const DEFAULT_PAYMENT_FORWARDER: Address = address!("0xFEEEEEE44046c3f61a8CC081E0918eF0de0a7ffC");
+
+const PAYMENT_FORWARDER_VAR: &str = "PAYMENT_FORWARDER_ADDRESS";
+
+/// <https://github.com/gattaca-com/helix/pull/466>. Overridable per chain; the code hash is
+/// not, so a wrong address fails closed.
+pub static PAYMENT_FORWARDER: LazyLock<Address> =
+    LazyLock::new(|| match std::env::var(PAYMENT_FORWARDER_VAR) {
+        Ok(value) => value
+            .parse()
+            .unwrap_or_else(|_| panic!("{PAYMENT_FORWARDER_VAR} is not a valid address: {value}")),
+        Err(_) => DEFAULT_PAYMENT_FORWARDER,
+    });
+
+/// `[4-byte timestamp][20-byte recipient]`
+const PAYMENT_FORWARDER_CALLDATA_LEN: usize = 24;
+
+/// A value call to a codeless address succeeds and keeps the value, so without this a payment
+/// would validate on a chain lacking the forwarder while the recipient received nothing.
+const PAYMENT_FORWARDER_CODE_HASH: B256 =
+    b256!("0xd9f5db49d3c0a174c39701485406cd78d01dd27f73b7ef7b883e5f69d8103220");
+
+/// Trailing bytes are inert: the contract reads one calldata word and forwards nothing. Shorter
+/// input would zero-pad the recipient and burn the value, so it is rejected.
+fn payment_forwarder_recipient(input: &[u8]) -> Option<Address> {
+    (input.len() >= PAYMENT_FORWARDER_CALLDATA_LEN)
+        .then(|| Address::from_slice(&input[4..PAYMENT_FORWARDER_CALLDATA_LEN]))
+}
 
 /// The type that implements the `validation` rpc namespace trait
 #[derive(Clone, Debug, derive_more::Deref)]
@@ -331,15 +360,22 @@ where
             return Err(ValidationApiError::ProposerPayment);
         }
 
-        if tx.to() != Some(message.proposer_fee_recipient) {
+        let paid_directly =
+            tx.to() == Some(message.proposer_fee_recipient) && tx.input().is_empty();
+        let paid_via_forwarder = tx.to() == Some(*PAYMENT_FORWARDER)
+            && payment_forwarder_recipient(tx.input()) == Some(message.proposer_fee_recipient)
+            && output.state.state.get(&*PAYMENT_FORWARDER).is_some_and(|account| {
+                account
+                    .info
+                    .as_ref()
+                    .is_some_and(|info| info.code_hash == PAYMENT_FORWARDER_CODE_HASH)
+            });
+
+        if !paid_directly && !paid_via_forwarder {
             return Err(ValidationApiError::ProposerPayment);
         }
 
         if tx.value() != message.value {
-            return Err(ValidationApiError::ProposerPayment);
-        }
-
-        if !tx.input().is_empty() {
             return Err(ValidationApiError::ProposerPayment);
         }
 
@@ -721,8 +757,81 @@ pub(crate) struct ValidationMetrics {
 
 #[cfg(test)]
 mod tests {
-    use super::{hash_disallow_list, AddressSet};
+    use super::{
+        hash_disallow_list, payment_forwarder_recipient, AddressSet, DEFAULT_PAYMENT_FORWARDER,
+        PAYMENT_FORWARDER, PAYMENT_FORWARDER_CALLDATA_LEN, PAYMENT_FORWARDER_CODE_HASH,
+    };
+    use alloy_primitives::keccak256;
     use revm_primitives::Address;
+
+    /// 4-byte big-endian timestamp followed by the 20-byte recipient.
+    fn forwarder_calldata(recipient: Address, timestamp: u32) -> Vec<u8> {
+        let mut input = timestamp.to_be_bytes().to_vec();
+        input.extend_from_slice(recipient.as_slice());
+        input
+    }
+
+    #[test]
+    fn payment_forwarder_defaults_to_the_canonical_deployment() {
+        assert_eq!(*PAYMENT_FORWARDER, DEFAULT_PAYMENT_FORWARDER);
+    }
+
+    /// If this stops matching, the contract changed and its address changed with it.
+    #[test]
+    fn payment_forwarder_code_hash_matches_the_deployed_runtime() {
+        let runtime = alloy_primitives::hex!("5f358060e01c4218600f5760401cff5b5f5ffd00");
+
+        assert_eq!(keccak256(runtime), PAYMENT_FORWARDER_CODE_HASH);
+    }
+
+    #[test]
+    fn payment_forwarder_recipient_reads_the_encoded_address() {
+        let recipient = Address::from([7u8; 20]);
+        let input = forwarder_calldata(recipient, 1_760_000_000);
+
+        assert_eq!(input.len(), PAYMENT_FORWARDER_CALLDATA_LEN);
+        assert_eq!(payment_forwarder_recipient(&input), Some(recipient));
+    }
+
+    #[test]
+    fn payment_forwarder_recipient_rejects_short_calldata() {
+        let recipient = Address::from([7u8; 20]);
+
+        for len in 0..PAYMENT_FORWARDER_CALLDATA_LEN {
+            let mut input = forwarder_calldata(recipient, 1_760_000_000);
+            input.truncate(len);
+
+            assert_eq!(payment_forwarder_recipient(&input), None, "accepted {len} bytes");
+        }
+    }
+
+    #[test]
+    fn payment_forwarder_recipient_ignores_trailing_calldata() {
+        let recipient = Address::from([7u8; 20]);
+
+        for extra in 1..=64usize {
+            let mut input = forwarder_calldata(recipient, 1_760_000_000);
+            input.extend(std::iter::repeat_n(0xABu8, extra));
+
+            assert_eq!(
+                payment_forwarder_recipient(&input),
+                Some(recipient),
+                "misparsed with {extra} trailing bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn payment_forwarder_recipient_ignores_the_timestamp_value() {
+        let recipient = Address::from([7u8; 20]);
+
+        for timestamp in [0u32, 1, 1_760_000_000, u32::MAX] {
+            assert_eq!(
+                payment_forwarder_recipient(&forwarder_calldata(recipient, timestamp)),
+                Some(recipient)
+            );
+        }
+    }
 
     #[test]
     fn test_hash_disallow_list_deterministic() {
