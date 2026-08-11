@@ -38,7 +38,9 @@ use reth_rpc_api::{
     BuilderBlockValidationRequestV6, TransactionFilter,
 };
 use reth_rpc_server_types::result::{internal_rpc_err, invalid_params_rpc_err};
-use reth_storage_api::{BlockReaderIdExt, HashedPostStateProvider, StateProviderFactory};
+use reth_storage_api::{
+    AccountReader, BlockReaderIdExt, HashedPostStateProvider, StateProviderFactory,
+};
 use reth_tasks::Runtime;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -411,9 +413,11 @@ where
         let paid_via_forwarder = tx.to().is_some_and(|to| {
             PAYMENT_FORWARDERS.get(&to).is_some_and(|code_hash| {
                 payment_forwarder_recipient(tx.input()) == Some(message.proposer_fee_recipient) &&
-                    output.state.state.get(&to).is_some_and(|account| {
-                        account.info.as_ref().is_some_and(|info| info.code_hash == *code_hash)
-                    })
+                    self.provider.latest().and_then(|state| state.basic_account(&to)).is_ok_and(
+                        |account| {
+                            account.is_some_and(|account| account.bytecode_hash == Some(*code_hash))
+                        },
+                    )
             })
         });
 
