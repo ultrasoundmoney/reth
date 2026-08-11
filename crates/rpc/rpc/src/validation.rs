@@ -798,17 +798,134 @@ pub(crate) struct ValidationMetrics {
 mod tests {
     use super::{
         hash_disallow_list, parse_payment_forwarders, payment_forwarder_recipient, AddressSet,
-        DEFAULT_PAYMENT_FORWARDERS, PAYMENT_FORWARDERS, PAYMENT_FORWARDER_CALLDATA_LEN,
+        ValidationApi, ValidationApiConfig, DEFAULT_PAYMENT_FORWARDERS, PAYMENT_FORWARDERS,
+        PAYMENT_FORWARDER_CALLDATA_LEN,
     };
+    use alloy_consensus::{Header, TxEip1559};
     use alloy_primitives::keccak256;
-    use revm_primitives::{Address, B256};
-    use std::collections::HashMap;
+    use alloy_rpc_types_beacon::relay::BidTrace;
+    use alloy_rpc_types_engine::ExecutionData;
+    use reth_chainspec::ChainSpecBuilder;
+    use reth_consensus::noop::NoopConsensus;
+    use reth_engine_primitives::PayloadValidator;
+    use reth_ethereum_engine_primitives::EthEngineTypes;
+    use reth_ethereum_primitives::{Block, BlockBody, Transaction};
+    use reth_evm::{execute::Executor, ConfigureEvm};
+    use reth_evm_ethereum::EthEvmConfig;
+    use reth_node_api::NewPayloadError;
+    use reth_primitives_traits::{
+        crypto::secp256k1::public_key_to_address, RecoveredBlock, SealedBlock,
+    };
+    use reth_provider::test_utils::{ExtendedAccount, MockEthProvider};
+    use reth_revm::database::StateProviderDatabase;
+    use reth_storage_api::StateProviderFactory;
+    use reth_tasks::Runtime;
+    use reth_testing_utils::generators;
+    use revm_primitives::{Address, TxKind, B256, U256};
+    use std::{collections::HashMap, sync::Arc};
 
     /// 4-byte big-endian timestamp followed by the 20-byte recipient.
     fn forwarder_calldata(recipient: Address, timestamp: u32) -> Vec<u8> {
         let mut input = timestamp.to_be_bytes().to_vec();
         input.extend_from_slice(recipient.as_slice());
         input
+    }
+
+    struct StubPayloadValidator;
+
+    impl PayloadValidator<EthEngineTypes> for StubPayloadValidator {
+        type Block = Block;
+
+        fn convert_payload_to_block(
+            &self,
+            _payload: ExecutionData,
+        ) -> Result<SealedBlock<Block>, NewPayloadError> {
+            unimplemented!("ensure_payment never touches the payload validator")
+        }
+    }
+
+    /// Reproduces the mainnet failure at slot 14968908 end to end: a correct forwarder payment,
+    /// actually executed, where the fee recipient's own spending makes the balance-delta
+    /// shortcut miss. `ensure_payment` must accept it on the last-transaction path.
+    ///
+    /// The sender is also the fee recipient, so its gas spend puts the balance delta below the
+    /// bid and validation falls through to the forwarder check.
+    #[test]
+    fn ensure_payment_accepts_an_executed_forwarder_payment() {
+        let (forwarder, _) = DEFAULT_PAYMENT_FORWARDERS[0];
+        let runtime = alloy_primitives::hex!("5f358060e01c4218600f5760401cff5b5f5ffd00");
+        let timestamp: u64 = 1_786_450_919;
+        let value = U256::from(8_594_702_506_957_281u64);
+        let base_fee: u64 = 7;
+
+        let chain_spec = Arc::new(ChainSpecBuilder::mainnet().cancun_activated().build());
+
+        let mut rng = generators::rng();
+        let key = generators::generate_key(&mut rng);
+        let fee_recipient = public_key_to_address(key.public_key());
+
+        let provider = MockEthProvider::default().with_chain_spec((*chain_spec).clone());
+        provider.add_account(
+            fee_recipient,
+            ExtendedAccount::new(0, U256::from(10).pow(U256::from(18))),
+        );
+        provider.add_account(
+            forwarder,
+            ExtendedAccount::new(1, U256::ZERO).with_bytecode(runtime.to_vec().into()),
+        );
+
+        let tx = generators::sign_tx_with_key_pair(
+            key,
+            Transaction::Eip1559(TxEip1559 {
+                chain_id: chain_spec.chain.id(),
+                nonce: 0,
+                gas_limit: 100_000,
+                max_fee_per_gas: base_fee as u128,
+                max_priority_fee_per_gas: 0,
+                to: TxKind::Call(forwarder),
+                value,
+                input: forwarder_calldata(fee_recipient, timestamp as u32).into(),
+                ..Default::default()
+            }),
+        );
+
+        let header = Header {
+            timestamp,
+            base_fee_per_gas: Some(base_fee),
+            gas_limit: 30_000_000,
+            parent_beacon_block_root: Some(B256::ZERO),
+            excess_blob_gas: Some(0),
+            blob_gas_used: Some(0),
+            ..Default::default()
+        };
+        let block = RecoveredBlock::new_unhashed(
+            Block { header, body: BlockBody { transactions: vec![tx], ..Default::default() } },
+            vec![fee_recipient],
+        );
+
+        let evm_config = EthEvmConfig::new(chain_spec);
+        let output = evm_config
+            .batch_executor(StateProviderDatabase::new(provider.latest().unwrap()))
+            .execute(&block)
+            .unwrap();
+        assert!(output.receipts.last().unwrap().success, "the payment executed");
+
+        let message =
+            BidTrace { proposer_fee_recipient: fee_recipient, value, ..Default::default() };
+
+        let api: ValidationApi<_, _, EthEngineTypes> = ValidationApi::new(
+            provider,
+            Arc::new(NoopConsensus::default()),
+            evm_config,
+            ValidationApiConfig::default(),
+            Runtime::test(),
+            Arc::new(StubPayloadValidator),
+        );
+
+        assert!(
+            api.ensure_payment(block.sealed_block(), &output, &message).is_ok(),
+            "a correct forwarder payment must validate"
+        );
     }
 
     #[test]
