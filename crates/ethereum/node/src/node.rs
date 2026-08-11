@@ -4,6 +4,7 @@ pub use crate::{payload::EthereumPayloadBuilder, EthereumEngineValidator};
 use crate::{EthEngineTypes, EthEvmConfig};
 use alloy_eips::{eip7840::BlobParams, merge::EPOCH_SLOTS};
 use alloy_network::Ethereum;
+use alloy_primitives::map::AddressSet;
 use alloy_rpc_types_engine::ExecutionData;
 use reth_chainspec::{ChainSpec, EthChainSpec, EthereumHardforks, Hardforks};
 use reth_engine_local::LocalPayloadAttributesBuilder;
@@ -61,7 +62,6 @@ use std::{
     sync::Arc,
     time::{Duration, SystemTime},
 };
-use alloy_primitives::map::AddressSet;
 
 /// How often a running node re-fetches the builder disallow list from its url.
 const DISALLOW_REFRESH_INTERVAL: Duration = Duration::from_secs(300);
