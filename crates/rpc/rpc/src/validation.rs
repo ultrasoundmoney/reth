@@ -65,13 +65,12 @@ const PAYMENT_FORWARDERS_VAR: &str = "PAYMENT_FORWARDERS";
 /// The code hash is part of the entry and never inferred from the chain: a value call to a
 /// codeless address succeeds and keeps the value, so an address on its own would validate a
 /// payment the recipient never received.
-pub(crate) static PAYMENT_FORWARDERS: LazyLock<HashMap<Address, B256>> = LazyLock::new(|| {
-    match std::env::var(PAYMENT_FORWARDERS_VAR) {
+pub(crate) static PAYMENT_FORWARDERS: LazyLock<HashMap<Address, B256>> =
+    LazyLock::new(|| match std::env::var(PAYMENT_FORWARDERS_VAR) {
         Ok(value) => parse_payment_forwarders(&value)
             .unwrap_or_else(|error| panic!("{PAYMENT_FORWARDERS_VAR} is invalid: {error}")),
         Err(_) => DEFAULT_PAYMENT_FORWARDERS.into_iter().collect(),
-    }
-});
+    });
 
 /// Rejects an empty list: disabling forwarder payments is not a configuration we want to reach
 /// by accident, and a typo that parsed to nothing would silently demote every builder using one.
@@ -221,8 +220,8 @@ where
                 if disallow.contains(sender) {
                     return Err(ValidationApiError::Blacklist(*sender));
                 }
-                if let Some(to) = tx.to()
-                    && disallow.contains(&to)
+                if let Some(to) = tx.to() &&
+                    disallow.contains(&to)
                 {
                     return Err(ValidationApiError::Blacklist(to));
                 }
@@ -241,8 +240,8 @@ where
                 .sealed_header_by_hash(block.parent_hash())?
                 .ok_or_else(|| ValidationApiError::MissingParentBlock)?;
 
-            if latest_header.number().saturating_sub(parent_header.number())
-                > self.validation_window
+            if latest_header.number().saturating_sub(parent_header.number()) >
+                self.validation_window
             {
                 return Err(ValidationApiError::BlockTooOld);
             }
@@ -404,12 +403,9 @@ where
             tx.to() == Some(message.proposer_fee_recipient) && tx.input().is_empty();
         let paid_via_forwarder = tx.to().is_some_and(|to| {
             PAYMENT_FORWARDERS.get(&to).is_some_and(|code_hash| {
-                payment_forwarder_recipient(tx.input()) == Some(message.proposer_fee_recipient)
-                    && output.state.state.get(&to).is_some_and(|account| {
-                        account
-                            .info
-                            .as_ref()
-                            .is_some_and(|info| info.code_hash == *code_hash)
+                payment_forwarder_recipient(tx.input()) == Some(message.proposer_fee_recipient) &&
+                    output.state.state.get(&to).is_some_and(|account| {
+                        account.info.as_ref().is_some_and(|info| info.code_hash == *code_hash)
                     })
             })
         });
@@ -422,8 +418,8 @@ where
             return Err(ValidationApiError::ProposerPayment);
         }
 
-        if let Some(block_base_fee) = block.header().base_fee_per_gas()
-            && tx.effective_tip_per_gas(block_base_fee).unwrap_or_default() != 0
+        if let Some(block_base_fee) = block.header().base_fee_per_gas() &&
+            tx.effective_tip_per_gas(block_base_fee).unwrap_or_default() != 0
         {
             return Err(ValidationApiError::ProposerPayment);
         }
@@ -436,8 +432,8 @@ where
         &self,
         mut blobs_bundle: BlobsBundleV1,
     ) -> Result<Vec<B256>, ValidationApiError> {
-        if blobs_bundle.commitments.len() != blobs_bundle.proofs.len()
-            || blobs_bundle.commitments.len() != blobs_bundle.blobs.len()
+        if blobs_bundle.commitments.len() != blobs_bundle.proofs.len() ||
+            blobs_bundle.commitments.len() != blobs_bundle.blobs.len()
         {
             return Err(ValidationApiError::InvalidBlobsBundle);
         }
@@ -547,8 +543,8 @@ where
 
         // Check block size as per EIP-7934 (only applies when Osaka hardfork is active)
         let chain_spec = self.provider.chain_spec();
-        if chain_spec.is_osaka_active_at_timestamp(block.timestamp())
-            && block.rlp_length() > MAX_RLP_BLOCK_SIZE
+        if chain_spec.is_osaka_active_at_timestamp(block.timestamp()) &&
+            block.rlp_length() > MAX_RLP_BLOCK_SIZE
         {
             return Err(ValidationApiError::Consensus(ConsensusError::BlockTooLarge {
                 rlp_length: block.rlp_length(),
@@ -762,20 +758,20 @@ pub enum ValidationApiError {
 impl From<ValidationApiError> for ErrorObject<'static> {
     fn from(error: ValidationApiError) -> Self {
         match error {
-            ValidationApiError::GasLimitMismatch(_)
-            | ValidationApiError::GasUsedMismatch(_)
-            | ValidationApiError::ParentHashMismatch(_)
-            | ValidationApiError::BlockHashMismatch(_)
-            | ValidationApiError::Blacklist(_)
-            | ValidationApiError::ProposerPayment
-            | ValidationApiError::InvalidBlobsBundle
-            | ValidationApiError::Blob(_) => invalid_params_rpc_err(error.to_string()),
+            ValidationApiError::GasLimitMismatch(_) |
+            ValidationApiError::GasUsedMismatch(_) |
+            ValidationApiError::ParentHashMismatch(_) |
+            ValidationApiError::BlockHashMismatch(_) |
+            ValidationApiError::Blacklist(_) |
+            ValidationApiError::ProposerPayment |
+            ValidationApiError::InvalidBlobsBundle |
+            ValidationApiError::Blob(_) => invalid_params_rpc_err(error.to_string()),
 
-            ValidationApiError::MissingLatestBlock
-            | ValidationApiError::MissingParentBlock
-            | ValidationApiError::BlockTooOld
-            | ValidationApiError::Consensus(_)
-            | ValidationApiError::Provider(_) => internal_rpc_err(error.to_string()),
+            ValidationApiError::MissingLatestBlock |
+            ValidationApiError::MissingParentBlock |
+            ValidationApiError::BlockTooOld |
+            ValidationApiError::Consensus(_) |
+            ValidationApiError::Provider(_) => internal_rpc_err(error.to_string()),
             ValidationApiError::Execution(err) => match err {
                 error @ BlockExecutionError::Validation(_) => {
                     invalid_params_rpc_err(error.to_string())
