@@ -39,12 +39,80 @@ use reth_rpc_api::{
 use reth_rpc_server_types::result::{internal_rpc_err, invalid_params_rpc_err};
 use reth_storage_api::{BlockReaderIdExt, StateProviderFactory};
 use reth_tasks::Runtime;
-use revm_primitives::{Address, B256, U256};
+use revm_primitives::{address, b256, Address, B256, U256};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::sync::Arc;
+use std::{
+    collections::HashMap,
+    sync::{Arc, LazyLock},
+};
 use tokio::sync::{oneshot, RwLock};
 use tracing::warn;
+
+/// <https://github.com/gattaca-com/helix/pull/466>.
+const DEFAULT_PAYMENT_FORWARDERS: [(Address, B256); 1] = [(
+    address!("0xFEEEEEE44046c3f61a8CC081E0918eF0de0a7ffC"),
+    b256!("0xd9f5db49d3c0a174c39701485406cd78d01dd27f73b7ef7b883e5f69d8103220"),
+)];
+
+const PAYMENT_FORWARDERS_VAR: &str = "PAYMENT_FORWARDERS";
+
+/// Accepted forwarders, as comma-separated `address:code_hash` pairs.
+///
+/// A list rather than one entry so a redeployment can be accepted alongside the old contract,
+/// instead of needing a flag day where one of the two is rejected.
+///
+/// The code hash is part of the entry and never inferred from the chain: a value call to a
+/// codeless address succeeds and keeps the value, so an address on its own would validate a
+/// payment the recipient never received.
+pub(crate) static PAYMENT_FORWARDERS: LazyLock<HashMap<Address, B256>> =
+    LazyLock::new(|| match std::env::var(PAYMENT_FORWARDERS_VAR) {
+        Ok(value) => parse_payment_forwarders(&value)
+            .unwrap_or_else(|error| panic!("{PAYMENT_FORWARDERS_VAR} is invalid: {error}")),
+        Err(_) => DEFAULT_PAYMENT_FORWARDERS.into_iter().collect(),
+    });
+
+/// Rejects an empty list: disabling forwarder payments is not a configuration we want to reach
+/// by accident, and a typo that parsed to nothing would silently demote every builder using one.
+fn parse_payment_forwarders(value: &str) -> Result<HashMap<Address, B256>, String> {
+    let forwarders = value
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| {
+            let (address, code_hash) = entry
+                .split_once(':')
+                .ok_or_else(|| format!("expected `address:code_hash`, got `{entry}`"))?;
+
+            Ok((
+                address
+                    .trim()
+                    .parse::<Address>()
+                    .map_err(|_| format!("invalid address `{address}`"))?,
+                code_hash
+                    .trim()
+                    .parse::<B256>()
+                    .map_err(|_| format!("invalid code hash `{code_hash}`"))?,
+            ))
+        })
+        .collect::<Result<HashMap<_, _>, String>>()?;
+
+    if forwarders.is_empty() {
+        return Err("no forwarders configured".to_string());
+    }
+
+    Ok(forwarders)
+}
+
+/// `[4-byte timestamp][20-byte recipient]`
+const PAYMENT_FORWARDER_CALLDATA_LEN: usize = 24;
+
+/// Trailing bytes are inert: the contract reads one calldata word and forwards nothing. Shorter
+/// input would zero-pad the recipient and burn the value, so it is rejected.
+fn payment_forwarder_recipient(input: &[u8]) -> Option<Address> {
+    (input.len() >= PAYMENT_FORWARDER_CALLDATA_LEN)
+        .then(|| Address::from_slice(&input[4..PAYMENT_FORWARDER_CALLDATA_LEN]))
+}
 
 /// The type that implements the `validation` rpc namespace trait
 #[derive(Clone, Debug, derive_more::Deref)]
@@ -152,8 +220,8 @@ where
                 if disallow.contains(sender) {
                     return Err(ValidationApiError::Blacklist(*sender));
                 }
-                if let Some(to) = tx.to()
-                    && disallow.contains(&to)
+                if let Some(to) = tx.to() &&
+                    disallow.contains(&to)
                 {
                     return Err(ValidationApiError::Blacklist(to));
                 }
@@ -172,8 +240,8 @@ where
                 .sealed_header_by_hash(block.parent_hash())?
                 .ok_or_else(|| ValidationApiError::MissingParentBlock)?;
 
-            if latest_header.number().saturating_sub(parent_header.number())
-                > self.validation_window
+            if latest_header.number().saturating_sub(parent_header.number()) >
+                self.validation_window
             {
                 return Err(ValidationApiError::BlockTooOld);
             }
@@ -331,7 +399,18 @@ where
             return Err(ValidationApiError::ProposerPayment);
         }
 
-        if tx.to() != Some(message.proposer_fee_recipient) {
+        let paid_directly =
+            tx.to() == Some(message.proposer_fee_recipient) && tx.input().is_empty();
+        let paid_via_forwarder = tx.to().is_some_and(|to| {
+            PAYMENT_FORWARDERS.get(&to).is_some_and(|code_hash| {
+                payment_forwarder_recipient(tx.input()) == Some(message.proposer_fee_recipient) &&
+                    output.state.state.get(&to).is_some_and(|account| {
+                        account.info.as_ref().is_some_and(|info| info.code_hash == *code_hash)
+                    })
+            })
+        });
+
+        if !paid_directly && !paid_via_forwarder {
             return Err(ValidationApiError::ProposerPayment);
         }
 
@@ -339,12 +418,8 @@ where
             return Err(ValidationApiError::ProposerPayment);
         }
 
-        if !tx.input().is_empty() {
-            return Err(ValidationApiError::ProposerPayment);
-        }
-
-        if let Some(block_base_fee) = block.header().base_fee_per_gas()
-            && tx.effective_tip_per_gas(block_base_fee).unwrap_or_default() != 0
+        if let Some(block_base_fee) = block.header().base_fee_per_gas() &&
+            tx.effective_tip_per_gas(block_base_fee).unwrap_or_default() != 0
         {
             return Err(ValidationApiError::ProposerPayment);
         }
@@ -357,8 +432,8 @@ where
         &self,
         mut blobs_bundle: BlobsBundleV1,
     ) -> Result<Vec<B256>, ValidationApiError> {
-        if blobs_bundle.commitments.len() != blobs_bundle.proofs.len()
-            || blobs_bundle.commitments.len() != blobs_bundle.blobs.len()
+        if blobs_bundle.commitments.len() != blobs_bundle.proofs.len() ||
+            blobs_bundle.commitments.len() != blobs_bundle.blobs.len()
         {
             return Err(ValidationApiError::InvalidBlobsBundle);
         }
@@ -468,8 +543,8 @@ where
 
         // Check block size as per EIP-7934 (only applies when Osaka hardfork is active)
         let chain_spec = self.provider.chain_spec();
-        if chain_spec.is_osaka_active_at_timestamp(block.timestamp())
-            && block.rlp_length() > MAX_RLP_BLOCK_SIZE
+        if chain_spec.is_osaka_active_at_timestamp(block.timestamp()) &&
+            block.rlp_length() > MAX_RLP_BLOCK_SIZE
         {
             return Err(ValidationApiError::Consensus(ConsensusError::BlockTooLarge {
                 rlp_length: block.rlp_length(),
@@ -683,20 +758,20 @@ pub enum ValidationApiError {
 impl From<ValidationApiError> for ErrorObject<'static> {
     fn from(error: ValidationApiError) -> Self {
         match error {
-            ValidationApiError::GasLimitMismatch(_)
-            | ValidationApiError::GasUsedMismatch(_)
-            | ValidationApiError::ParentHashMismatch(_)
-            | ValidationApiError::BlockHashMismatch(_)
-            | ValidationApiError::Blacklist(_)
-            | ValidationApiError::ProposerPayment
-            | ValidationApiError::InvalidBlobsBundle
-            | ValidationApiError::Blob(_) => invalid_params_rpc_err(error.to_string()),
+            ValidationApiError::GasLimitMismatch(_) |
+            ValidationApiError::GasUsedMismatch(_) |
+            ValidationApiError::ParentHashMismatch(_) |
+            ValidationApiError::BlockHashMismatch(_) |
+            ValidationApiError::Blacklist(_) |
+            ValidationApiError::ProposerPayment |
+            ValidationApiError::InvalidBlobsBundle |
+            ValidationApiError::Blob(_) => invalid_params_rpc_err(error.to_string()),
 
-            ValidationApiError::MissingLatestBlock
-            | ValidationApiError::MissingParentBlock
-            | ValidationApiError::BlockTooOld
-            | ValidationApiError::Consensus(_)
-            | ValidationApiError::Provider(_) => internal_rpc_err(error.to_string()),
+            ValidationApiError::MissingLatestBlock |
+            ValidationApiError::MissingParentBlock |
+            ValidationApiError::BlockTooOld |
+            ValidationApiError::Consensus(_) |
+            ValidationApiError::Provider(_) => internal_rpc_err(error.to_string()),
             ValidationApiError::Execution(err) => match err {
                 error @ BlockExecutionError::Validation(_) => {
                     invalid_params_rpc_err(error.to_string())
@@ -721,8 +796,121 @@ pub(crate) struct ValidationMetrics {
 
 #[cfg(test)]
 mod tests {
-    use super::{hash_disallow_list, AddressSet};
-    use revm_primitives::Address;
+    use super::{
+        hash_disallow_list, parse_payment_forwarders, payment_forwarder_recipient, AddressSet,
+        DEFAULT_PAYMENT_FORWARDERS, PAYMENT_FORWARDERS, PAYMENT_FORWARDER_CALLDATA_LEN,
+    };
+    use alloy_primitives::keccak256;
+    use revm_primitives::{Address, B256};
+    use std::collections::HashMap;
+
+    /// 4-byte big-endian timestamp followed by the 20-byte recipient.
+    fn forwarder_calldata(recipient: Address, timestamp: u32) -> Vec<u8> {
+        let mut input = timestamp.to_be_bytes().to_vec();
+        input.extend_from_slice(recipient.as_slice());
+        input
+    }
+
+    #[test]
+    fn payment_forwarders_default_to_the_canonical_deployment() {
+        let expected: HashMap<Address, B256> = DEFAULT_PAYMENT_FORWARDERS.into_iter().collect();
+
+        assert_eq!(*PAYMENT_FORWARDERS, expected);
+    }
+
+    /// If this stops matching, the contract changed and its address changed with it.
+    #[test]
+    fn payment_forwarder_code_hash_matches_the_deployed_runtime() {
+        let runtime = alloy_primitives::hex!("5f358060e01c4218600f5760401cff5b5f5ffd00");
+        let (_, code_hash) = DEFAULT_PAYMENT_FORWARDERS[0];
+
+        assert_eq!(keccak256(runtime), code_hash);
+    }
+
+    /// The migration case: both deployments accepted at once, each pinned to its own code hash.
+    #[test]
+    fn parse_payment_forwarders_reads_several_pairs() {
+        let old = Address::from([1u8; 20]);
+        let new = Address::from([2u8; 20]);
+        let old_hash = B256::from([3u8; 32]);
+        let new_hash = B256::from([4u8; 32]);
+
+        let parsed =
+            parse_payment_forwarders(&format!(" {old}:{old_hash} , {new}:{new_hash} ")).unwrap();
+
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed.get(&old), Some(&old_hash));
+        assert_eq!(parsed.get(&new), Some(&new_hash));
+    }
+
+    /// A typo must not silently parse to a list that accepts nothing - that would demote every
+    /// builder paying through a forwarder.
+    #[test]
+    fn parse_payment_forwarders_rejects_malformed_input() {
+        let address = Address::from([1u8; 20]);
+        let hash = B256::from([3u8; 32]);
+
+        for input in [
+            String::new(),
+            "  ,  ".to_string(),
+            format!("{address}"),
+            format!("{address}:"),
+            format!(":{hash}"),
+            format!("{address}:0xnothex"),
+            format!("notanaddress:{hash}"),
+        ] {
+            assert!(parse_payment_forwarders(&input).is_err(), "accepted `{input}`");
+        }
+    }
+
+    #[test]
+    fn payment_forwarder_recipient_reads_the_encoded_address() {
+        let recipient = Address::from([7u8; 20]);
+        let input = forwarder_calldata(recipient, 1_760_000_000);
+
+        assert_eq!(input.len(), PAYMENT_FORWARDER_CALLDATA_LEN);
+        assert_eq!(payment_forwarder_recipient(&input), Some(recipient));
+    }
+
+    #[test]
+    fn payment_forwarder_recipient_rejects_short_calldata() {
+        let recipient = Address::from([7u8; 20]);
+
+        for len in 0..PAYMENT_FORWARDER_CALLDATA_LEN {
+            let mut input = forwarder_calldata(recipient, 1_760_000_000);
+            input.truncate(len);
+
+            assert_eq!(payment_forwarder_recipient(&input), None, "accepted {len} bytes");
+        }
+    }
+
+    #[test]
+    fn payment_forwarder_recipient_ignores_trailing_calldata() {
+        let recipient = Address::from([7u8; 20]);
+
+        for extra in 1..=64usize {
+            let mut input = forwarder_calldata(recipient, 1_760_000_000);
+            input.extend(std::iter::repeat_n(0xABu8, extra));
+
+            assert_eq!(
+                payment_forwarder_recipient(&input),
+                Some(recipient),
+                "misparsed with {extra} trailing bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn payment_forwarder_recipient_ignores_the_timestamp_value() {
+        let recipient = Address::from([7u8; 20]);
+
+        for timestamp in [0u32, 1, 1_760_000_000, u32::MAX] {
+            assert_eq!(
+                payment_forwarder_recipient(&forwarder_calldata(recipient, timestamp)),
+                Some(recipient)
+            );
+        }
+    }
 
     #[test]
     fn test_hash_disallow_list_deterministic() {
