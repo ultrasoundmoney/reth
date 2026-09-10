@@ -29,7 +29,7 @@ use reth_metrics::{
 use reth_node_api::{NewPayloadError, PayloadTypes};
 use reth_primitives_traits::{
     constants::GAS_LIMIT_BOUND_DIVISOR, BlockBody, GotExpected, NodePrimitives, RecoveredBlock,
-    SealedBlock, SealedHeaderFor,
+    SealedHeaderFor,
 };
 use reth_revm::{cached::CachedReads, database::StateProviderDatabase};
 use reth_rpc_api::{
@@ -70,6 +70,19 @@ pub(crate) static PAYMENT_FORWARDERS: LazyLock<HashMap<Address, B256>> =
         Ok(value) => parse_payment_forwarders(&value)
             .unwrap_or_else(|error| panic!("{PAYMENT_FORWARDERS_VAR} is invalid: {error}")),
         Err(_) => DEFAULT_PAYMENT_FORWARDERS.into_iter().collect(),
+    });
+
+const MERGE_RELAY_SIGNER_VAR: &str = "MERGE_RELAY_SIGNER";
+
+pub(crate) static MERGE_RELAY_SIGNER: LazyLock<Option<Address>> =
+    LazyLock::new(|| match std::env::var(MERGE_RELAY_SIGNER_VAR) {
+        Ok(value) => Some(
+            value
+                .trim()
+                .parse()
+                .unwrap_or_else(|error| panic!("{MERGE_RELAY_SIGNER_VAR} is invalid: {error}")),
+        ),
+        Err(_) => None,
     });
 
 /// Rejects an empty list: disabling forwarder payments is not a configuration we want to reach
@@ -360,7 +373,7 @@ where
     /// to checking the latest block transaction.
     fn ensure_payment(
         &self,
-        block: &SealedBlock<<E::Primitives as NodePrimitives>::Block>,
+        block: &RecoveredBlock<<E::Primitives as NodePrimitives>::Block>,
         output: &BlockExecutionOutput<<E::Primitives as NodePrimitives>::Receipt>,
         message: &BidTrace,
     ) -> Result<(), ValidationApiError> {
@@ -397,6 +410,19 @@ where
 
         if !receipt.status() {
             return Err(ValidationApiError::ProposerPayment);
+        }
+
+        // A merged block pays the proposer across two transactions: the base builder's payment,
+        // which the merge engine verified against the base block before merging onto it, and the
+        // relay's own distribution appended after it. Neither check above can see that. The
+        // balance delta misses it whenever the fee recipient forwards what it receives, and the
+        // shape checks below only ever look at the trailing transaction, which is the
+        // distribution rather than the payment. Only the relay can sign as this address, so its
+        // presence identifies our own block; that the distribution executed is checked above.
+        if let Some(relay_signer) = *MERGE_RELAY_SIGNER &&
+            block.senders_iter().last() == Some(&relay_signer)
+        {
+            return Ok(());
         }
 
         let paid_directly =
@@ -925,7 +951,7 @@ mod tests {
         );
 
         assert!(
-            api.ensure_payment(block.sealed_block(), &output, &message).is_ok(),
+            api.ensure_payment(&block, &output, &message).is_ok(),
             "a correct forwarder payment must validate"
         );
     }
