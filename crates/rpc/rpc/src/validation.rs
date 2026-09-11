@@ -127,6 +127,94 @@ fn payment_forwarder_recipient(input: &[u8]) -> Option<Address> {
         .then(|| Address::from_slice(&input[4..PAYMENT_FORWARDER_CALLDATA_LEN]))
 }
 
+/// `execTransaction(address,uint256,bytes,uint8,uint256,uint256,uint256,address,address,bytes)`
+const SAFE_EXEC_TRANSACTION_SELECTOR: [u8; 4] = [0x6a, 0x76, 0x12, 0x02];
+
+/// `multiSend(bytes)` on `MultiSendCallOnly`.
+const MULTI_SEND_SELECTOR: [u8; 4] = [0x8d, 0x80, 0xff, 0x0a];
+
+/// A packed `MultiSend` entry ahead of its data:
+/// `[1 byte operation][20 byte to][32 byte value][32 byte data length]`.
+const MULTI_SEND_ENTRY_HEADER_LEN: usize = 85;
+
+/// Reads an abi word as a length or offset, rejecting anything too wide to index with.
+fn read_abi_length(input: &[u8], at: usize) -> Option<usize> {
+    let word = input.get(at..at.checked_add(32)?)?;
+
+    if word[..24].iter().any(|byte| *byte != 0) {
+        return None;
+    }
+
+    let bytes: [u8; 8] = word[24..].try_into().ok()?;
+
+    usize::try_from(u64::from_be_bytes(bytes)).ok()
+}
+
+/// Extracts the `head_index`th argument of abi encoded `calldata`, which must be a dynamic `bytes`.
+fn abi_bytes_arg(calldata: &[u8], head_index: usize) -> Option<&[u8]> {
+    let args = calldata.get(4..)?;
+    let offset = read_abi_length(args, head_index.checked_mul(32)?)?;
+    let length = read_abi_length(args, offset)?;
+    let start = offset.checked_add(32)?;
+
+    args.get(start..start.checked_add(length)?)
+}
+
+/// Sums the value of the `MultiSend` entries paying `recipient`.
+fn multi_send_value_to(payload: &[u8], recipient: Address) -> Option<U256> {
+    let mut total = U256::ZERO;
+    let mut cursor = 0usize;
+
+    while cursor < payload.len() {
+        let to = Address::from_slice(payload.get(cursor + 1..cursor + 21)?);
+        let value = U256::from_be_slice(payload.get(cursor + 21..cursor + 53)?);
+        let data_length = read_abi_length(payload, cursor + 53)?;
+
+        if to == recipient {
+            total = total.saturating_add(value);
+        }
+
+        cursor = cursor.checked_add(MULTI_SEND_ENTRY_HEADER_LEN)?.checked_add(data_length)?;
+    }
+
+    Some(total)
+}
+
+/// `ExecutionSuccess(bytes32,uint256)`, which a Safe emits only when its inner call succeeded.
+const SAFE_EXECUTION_SUCCESS_TOPIC: B256 =
+    b256!("0x442e715f626346e8c54381002da614f62bee8d27386535b2521ec8540898556e");
+
+/// Whether `safe` reported a successful inner call in these logs.
+///
+/// A Safe only reverts on a failing inner call when `safeTxGas` and `gasPrice` are both zero, and
+/// otherwise emits `ExecutionFailure` and leaves a successful receipt behind. So the event, not the
+/// receipt status, separates a distribution that paid from one that did not. It also bounds replay:
+/// a signed distribution lifted from a reorged block credits nothing unless it executed again here.
+fn safe_execution_succeeded(logs: &[alloy_primitives::Log], safe: Address) -> bool {
+    logs.iter().any(|log| {
+        log.address == safe && log.topics().first() == Some(&SAFE_EXECUTION_SUCCESS_TOPIC)
+    })
+}
+
+/// Value the relay's distribution pays `recipient`, or `None` when `input` is not a Safe
+/// `execTransaction` wrapping a `multiSend`.
+///
+/// The calldata only shows what the distribution was asked to pay, so the caller must separately
+/// establish that it executed.
+fn distribution_value_to(input: &[u8], recipient: Address) -> Option<U256> {
+    if input.get(..4)? != SAFE_EXEC_TRANSACTION_SELECTOR {
+        return None;
+    }
+
+    let inner = abi_bytes_arg(input, 2)?;
+
+    if inner.get(..4)? != MULTI_SEND_SELECTOR {
+        return None;
+    }
+
+    multi_send_value_to(abi_bytes_arg(inner, 0)?, recipient)
+}
+
 /// The type that implements the `validation` rpc namespace trait
 #[derive(Clone, Debug, derive_more::Deref)]
 pub struct ValidationApi<Provider, E: ConfigureEvm, T: PayloadTypes> {
@@ -413,16 +501,20 @@ where
         }
 
         // A merged block pays the proposer across two transactions: the base builder's payment,
-        // which the merge engine verified against the base block before merging onto it, and the
-        // relay's own distribution appended after it. Neither check above can see that. The
-        // balance delta misses it whenever the fee recipient forwards what it receives, and the
-        // shape checks below only ever look at the trailing transaction, which is the
-        // distribution rather than the payment. Only the relay can sign as this address, so its
-        // presence identifies our own block; that the distribution executed is checked above.
+        // wherever merging left it in the block, and the relay's own distribution appended after
+        // it. Neither check above can see that. The balance delta misses it whenever the fee
+        // recipient forwards what it receives, and the shape checks below only ever look at the
+        // trailing transaction, which is the distribution rather than the payment. Only the relay
+        // can sign as this address, so its presence identifies our own block.
         if let Some(relay_signer) = *MERGE_RELAY_SIGNER &&
             block.senders_iter().last() == Some(&relay_signer)
         {
-            return Ok(());
+            let credited =
+                self.credited_to_fee_recipient(block, output, message.proposer_fee_recipient);
+
+            return (credited >= message.value)
+                .then_some(())
+                .ok_or(ValidationApiError::ProposerPayment);
         }
 
         let paid_directly =
@@ -453,6 +545,55 @@ where
         }
 
         Ok(())
+    }
+
+    /// Sums what the block credits `fee_recipient` through payment shaped transactions: plain
+    /// transfers, forwarder calls, and the relay's own distribution.
+    /// Reverted transactions credit nothing.
+    fn credited_to_fee_recipient(
+        &self,
+        block: &RecoveredBlock<<E::Primitives as NodePrimitives>::Block>,
+        output: &BlockExecutionOutput<<E::Primitives as NodePrimitives>::Receipt>,
+        fee_recipient: Address,
+    ) -> U256 {
+        let paid_via_forwarder = |to: Address, input: &[u8]| {
+            PAYMENT_FORWARDERS.get(&to).is_some_and(|code_hash| {
+                payment_forwarder_recipient(input) == Some(fee_recipient) &&
+                    self.provider.latest().and_then(|state| state.basic_account(&to)).is_ok_and(
+                        |account| {
+                            account.is_some_and(|account| account.bytecode_hash == Some(*code_hash))
+                        },
+                    )
+            })
+        };
+
+        block
+            .body()
+            .transactions()
+            .iter()
+            .zip(block.senders_iter())
+            .zip(output.receipts.iter())
+            .filter(|((_, sender), receipt)| receipt.status() && **sender != fee_recipient)
+            .map(|((tx, sender), receipt)| {
+                let Some(to) = tx.to() else {
+                    return U256::ZERO;
+                };
+
+                if (to == fee_recipient && tx.input().is_empty()) ||
+                    paid_via_forwarder(to, tx.input())
+                {
+                    return tx.value();
+                }
+
+                if (*MERGE_RELAY_SIGNER).is_some_and(|relay_signer| *sender == relay_signer) &&
+                    safe_execution_succeeded(receipt.logs(), to)
+                {
+                    return distribution_value_to(tx.input(), fee_recipient).unwrap_or(U256::ZERO);
+                }
+
+                U256::ZERO
+            })
+            .fold(U256::ZERO, U256::saturating_add)
     }
 
     /// Validates the given [`BlobsBundleV1`] and returns versioned hashes for blobs.
@@ -825,12 +966,14 @@ pub(crate) struct ValidationMetrics {
 #[cfg(test)]
 mod tests {
     use super::{
-        hash_disallow_list, parse_payment_forwarders, payment_forwarder_recipient, AddressSet,
-        ValidationApi, ValidationApiConfig, DEFAULT_PAYMENT_FORWARDERS, PAYMENT_FORWARDERS,
-        PAYMENT_FORWARDER_CALLDATA_LEN,
+        distribution_value_to, hash_disallow_list, parse_payment_forwarders,
+        payment_forwarder_recipient, safe_execution_succeeded, AddressSet, ValidationApi,
+        ValidationApiConfig, DEFAULT_PAYMENT_FORWARDERS, MULTI_SEND_SELECTOR, PAYMENT_FORWARDERS,
+        PAYMENT_FORWARDER_CALLDATA_LEN, SAFE_EXECUTION_SUCCESS_TOPIC,
+        SAFE_EXEC_TRANSACTION_SELECTOR,
     };
     use alloy_consensus::{Header, TxEip1559};
-    use alloy_primitives::keccak256;
+    use alloy_primitives::{address, b256, keccak256};
     use alloy_rpc_types_beacon::relay::BidTrace;
     use alloy_rpc_types_engine::ExecutionData;
     use reth_chainspec::ChainSpecBuilder;
@@ -857,6 +1000,204 @@ mod tests {
         let mut input = timestamp.to_be_bytes().to_vec();
         input.extend_from_slice(recipient.as_slice());
         input
+    }
+
+    fn abi_word(value: usize) -> [u8; 32] {
+        U256::from(value).to_be_bytes()
+    }
+
+    /// Mirrors the relay's `build_multisend_payload`, with an added `data` so entries of a
+    /// non-fixed width are covered too.
+    fn multi_send_payload(entries: &[(Address, U256, Vec<u8>)]) -> Vec<u8> {
+        entries.iter().fold(Vec::new(), |mut payload, (to, value, data)| {
+            payload.push(0u8);
+            payload.extend_from_slice(to.as_slice());
+            payload.extend_from_slice(&value.to_be_bytes::<32>());
+            payload.extend_from_slice(&abi_word(data.len()));
+            payload.extend_from_slice(data);
+            payload
+        })
+    }
+
+    fn abi_encode_bytes(payload: &[u8]) -> Vec<u8> {
+        let mut encoded = abi_word(payload.len()).to_vec();
+        encoded.extend_from_slice(payload);
+        encoded.resize(32 + payload.len().div_ceil(32) * 32, 0);
+        encoded
+    }
+
+    fn multi_send_calldata(entries: &[(Address, U256, Vec<u8>)]) -> Vec<u8> {
+        let mut calldata = MULTI_SEND_SELECTOR.to_vec();
+        calldata.extend_from_slice(&abi_word(32));
+        calldata.extend_from_slice(&abi_encode_bytes(&multi_send_payload(entries)));
+        calldata
+    }
+
+    /// `execTransaction` calldata carrying `data` as its third argument.
+    fn exec_transaction_calldata(data: &[u8]) -> Vec<u8> {
+        const HEAD_LEN: usize = 10 * 32;
+
+        let encoded_data = abi_encode_bytes(data);
+
+        let mut calldata = SAFE_EXEC_TRANSACTION_SELECTOR.to_vec();
+        for word in [0, 0, HEAD_LEN, 1, 0, 0, 0, 0, 0, HEAD_LEN + encoded_data.len()] {
+            calldata.extend_from_slice(&abi_word(word));
+        }
+        calldata.extend_from_slice(&encoded_data);
+        calldata.extend_from_slice(&abi_encode_bytes(&[]));
+        calldata
+    }
+
+    fn distribution_calldata(entries: &[(Address, U256, Vec<u8>)]) -> Vec<u8> {
+        exec_transaction_calldata(&multi_send_calldata(entries))
+    }
+
+    fn safe_log(address: Address, topic: B256) -> alloy_primitives::Log {
+        alloy_primitives::Log::new_unchecked(address, vec![topic], Default::default())
+    }
+
+    /// Distribution transactions from merged blocks we delivered to mainnet, as
+    /// `(block number, proposer leg, proposer fee recipient, calldata)`.
+    ///
+    /// The leg is `proposer_value - original_value` as recorded in `merged_block`, so these pin the
+    /// decoder to calldata the relay actually produced rather than to the encoder below it.
+    const DELIVERED_DISTRIBUTIONS: [(u64, u64, Address, &str); 3] = [
+        (25953192, 23845723176864, address!("0x8696e84ab5e78983f2456bcb5c199eea9648c8c2"), "0x6a7612020000000000000000000000009641d764fc13c8b624c04430c7356c1c7c8102e2000000000000000000000000000000000000000000000000000041100b93fee0000000000000000000000000000000000000000000000000000000000000014000000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000819eb0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000002c000000000000000000000000000000000000000000000000000000000000001448d80ff0a000000000000000000000000000000000000000000000000000000000000002000000000000000000000000000000000000000000000000000000000000000ff004838b106fce9647bdf1e7877bf73ce8b0bad5f97000000000000000000000000000000000000000000000000000015b003dbffa00000000000000000000000000000000000000000000000000000000000000000008696e84ab5e78983f2456bcb5c199eea9648c8c2000000000000000000000000000000000000000000000000000015b003dbffa00000000000000000000000000000000000000000000000000000000000000000002b3604ded748e848176c045ec701bcf70176b618000000000000000000000000000000000000000000000000000015b003dbffa0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000041ef0e0ff7a017a109d2afe4b3722b26cff9b8ae88d72747e64dfb25a7d4266c353f21a3c5da7650920390990857c86906ec1da7349a064d0a99350bee0a2343231c00000000000000000000000000000000000000000000000000000000000000"),
+        (25953197, 19344068569468, address!("0x388c818ca8b9251b393131c08a736a67ccb19297"), "0x6a7612020000000000000000000000009641d764fc13c8b624c04430c7356c1c7c8102e2000000000000000000000000000000000000000000000000000034c7ad01bc74000000000000000000000000000000000000000000000000000000000000014000000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000cccccc000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000002c000000000000000000000000000000000000000000000000000000000000001448d80ff0a000000000000000000000000000000000000000000000000000000000000002000000000000000000000000000000000000000000000000000000000000000ff002b3604ded748e848176c045ec701bcf70176b61800000000000000000000000000000000000000000000000000001197e455e97c0000000000000000000000000000000000000000000000000000000000000000004838b106fce9647bdf1e7877bf73ce8b0bad5f9700000000000000000000000000000000000000000000000000001197e455e97c000000000000000000000000000000000000000000000000000000000000000000388c818ca8b9251b393131c08a736a67ccb1929700000000000000000000000000000000000000000000000000001197e455e97c0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000417cda46b781c7afecc03786e5c1465545854c5dc07274f35410164278b40a49f2220637705d9109f77ee5bfa0e9c75dcc82238cbb0a372cb9bee12c8f2fbe27451b00000000000000000000000000000000000000000000000000000000000000"),
+        (25953198, 2638279283548, address!("0xcc20850f1907be2aab7474b9819112e37e630d7b"), "0x6a7612020000000000000000000000009641d764fc13c8b624c04430c7356c1c7c8102e200000000000000000000000000000000000000000000000000000732d1193a14000000000000000000000000000000000000000000000000000000000000014000000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000cccccc000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000002c000000000000000000000000000000000000000000000000000000000000001448d80ff0a000000000000000000000000000000000000000000000000000000000000002000000000000000000000000000000000000000000000000000000000000000ff004838b106fce9647bdf1e7877bf73ce8b0bad5f970000000000000000000000000000000000000000000000000000026645b3135c000000000000000000000000000000000000000000000000000000000000000000cc20850f1907be2aab7474b9819112e37e630d7b0000000000000000000000000000000000000000000000000000026645b3135c0000000000000000000000000000000000000000000000000000000000000000002b3604ded748e848176c045ec701bcf70176b6180000000000000000000000000000000000000000000000000000026645b3135c000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000041155b1c3bb73f3b97c524ef4672208553221b24b5c9ffdcee7fc374722e9d45b14e91960c5602d6827584f8a4eb26dc6abddd73b430e91c71642f25ff711596da1b00000000000000000000000000000000000000000000000000000000000000"),
+    ];
+
+    #[test]
+    fn distribution_value_to_reads_delivered_merged_blocks() {
+        for (block_number, proposer_leg, fee_recipient, calldata) in DELIVERED_DISTRIBUTIONS {
+            let calldata = alloy_primitives::hex::decode(calldata).unwrap();
+
+            assert_eq!(
+                distribution_value_to(&calldata, fee_recipient),
+                Some(U256::from(proposer_leg)),
+                "block {block_number}"
+            );
+        }
+    }
+
+    /// The relay signs the same distribution to the base builder and to itself, so a recipient that
+    /// was not part of it has to read as nothing rather than as somebody else's leg.
+    #[test]
+    fn distribution_value_to_is_zero_for_a_bystander_of_a_delivered_block() {
+        let (block_number, _, _, calldata) = DELIVERED_DISTRIBUTIONS[0];
+        let calldata = alloy_primitives::hex::decode(calldata).unwrap();
+
+        assert_eq!(
+            distribution_value_to(&calldata, Address::from([0xAB; 20])),
+            Some(U256::ZERO),
+            "block {block_number}"
+        );
+    }
+
+    #[test]
+    fn safe_execution_success_topic_matches_the_event_signature() {
+        assert_eq!(SAFE_EXECUTION_SUCCESS_TOPIC, keccak256("ExecutionSuccess(bytes32,uint256)"));
+    }
+
+    #[test]
+    fn safe_execution_succeeded_requires_the_success_event_from_the_safe() {
+        /// `ExecutionFailure(bytes32,uint256)`
+        const FAILURE: B256 =
+            b256!("0x23428b18acfb3ea64b08dc0c1d296ea9c09702c09083ca5272e64d115b687d23");
+
+        let safe = Address::from([9u8; 20]);
+        let other = Address::from([8u8; 20]);
+
+        assert!(safe_execution_succeeded(&[safe_log(safe, SAFE_EXECUTION_SUCCESS_TOPIC)], safe));
+
+        // A Safe that swallows a failing inner call leaves a successful receipt behind, so this is
+        // the case the receipt status cannot see.
+        assert!(!safe_execution_succeeded(&[safe_log(safe, FAILURE)], safe));
+
+        assert!(!safe_execution_succeeded(&[safe_log(other, SAFE_EXECUTION_SUCCESS_TOPIC)], safe));
+        assert!(!safe_execution_succeeded(&[], safe));
+    }
+
+    #[test]
+    fn distribution_value_to_reads_the_proposer_leg() {
+        let proposer = Address::from([1u8; 20]);
+        let base_builder = Address::from([2u8; 20]);
+        let relay = Address::from([3u8; 20]);
+
+        let calldata = distribution_calldata(&[
+            (base_builder, U256::from(7u64), Vec::new()),
+            (proposer, U256::from(11u64), Vec::new()),
+            (relay, U256::from(13u64), Vec::new()),
+        ]);
+
+        assert_eq!(distribution_value_to(&calldata, proposer), Some(U256::from(11u64)));
+        assert_eq!(distribution_value_to(&calldata, base_builder), Some(U256::from(7u64)));
+    }
+
+    #[test]
+    fn distribution_value_to_sums_repeated_recipients() {
+        let proposer = Address::from([1u8; 20]);
+
+        let calldata = distribution_calldata(&[
+            (proposer, U256::from(11u64), Vec::new()),
+            (Address::from([2u8; 20]), U256::from(7u64), Vec::new()),
+            (proposer, U256::from(5u64), Vec::new()),
+        ]);
+
+        assert_eq!(distribution_value_to(&calldata, proposer), Some(U256::from(16u64)));
+    }
+
+    #[test]
+    fn distribution_value_to_is_zero_for_an_absent_recipient() {
+        let calldata =
+            distribution_calldata(&[(Address::from([2u8; 20]), U256::from(7u64), Vec::new())]);
+
+        assert_eq!(distribution_value_to(&calldata, Address::from([1u8; 20])), Some(U256::ZERO));
+    }
+
+    #[test]
+    fn distribution_value_to_walks_past_entries_carrying_data() {
+        let proposer = Address::from([1u8; 20]);
+
+        let calldata = distribution_calldata(&[
+            (Address::from([2u8; 20]), U256::from(7u64), vec![0xAB; 37]),
+            (proposer, U256::from(11u64), Vec::new()),
+        ]);
+
+        assert_eq!(distribution_value_to(&calldata, proposer), Some(U256::from(11u64)));
+    }
+
+    #[test]
+    fn distribution_value_to_rejects_calldata_that_is_not_a_safe_multisend() {
+        let proposer = Address::from([1u8; 20]);
+        let entries = [(proposer, U256::from(11u64), Vec::new())];
+
+        // a plain transfer, a bare multiSend without the Safe wrapper, and an execTransaction
+        // wrapping something else
+        assert_eq!(distribution_value_to(&[], proposer), None);
+        assert_eq!(distribution_value_to(&multi_send_calldata(&entries), proposer), None);
+        assert_eq!(distribution_value_to(&exec_transaction_calldata(&[0u8; 4]), proposer), None);
+    }
+
+    #[test]
+    fn distribution_value_to_rejects_truncated_calldata() {
+        let proposer = Address::from([1u8; 20]);
+        let entries = [(proposer, U256::from(11u64), Vec::new())];
+        let calldata = distribution_calldata(&entries);
+
+        // Everything past the multisend payload is zero padding and the unread `signatures`
+        // argument, so that is the point from which the decoder has all it reads.
+        let required_len = 4 + 10 * 32 + 32 + multi_send_calldata(&entries).len();
+
+        for len in 0..required_len {
+            assert_eq!(
+                distribution_value_to(&calldata[..len], proposer),
+                None,
+                "accepted {len} of the {required_len} bytes it reads"
+            );
+        }
+
+        assert!(distribution_value_to(&calldata[..required_len], proposer).is_some());
     }
 
     struct StubPayloadValidator;
