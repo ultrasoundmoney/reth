@@ -129,6 +129,86 @@ fn payment_forwarder_recipient(input: &[u8]) -> Option<Address> {
         .then(|| Address::from_slice(&input[4..PAYMENT_FORWARDER_CALLDATA_LEN]))
 }
 
+/// `execTransaction(address,uint256,bytes,uint8,uint256,uint256,uint256,address,address,bytes)`
+const SAFE_EXEC_TRANSACTION_SELECTOR: [u8; 4] = [0x6a, 0x76, 0x12, 0x02];
+
+/// `multiSend(bytes)` on `MultiSendCallOnly`.
+const MULTI_SEND_SELECTOR: [u8; 4] = [0x8d, 0x80, 0xff, 0x0a];
+
+/// A packed `MultiSend` entry ahead of its data:
+/// `[1 byte operation][20 byte to][32 byte value][32 byte data length]`.
+const MULTI_SEND_ENTRY_HEADER_LEN: usize = 85;
+
+/// Reads an abi word as a length or offset, rejecting anything too wide to index with.
+fn read_abi_length(input: &[u8], at: usize) -> Option<usize> {
+    let word = input.get(at..at.checked_add(32)?)?;
+
+    if word[..24].iter().any(|byte| *byte != 0) {
+        return None;
+    }
+
+    let bytes: [u8; 8] = word[24..].try_into().ok()?;
+
+    usize::try_from(u64::from_be_bytes(bytes)).ok()
+}
+
+/// Extracts the `head_index`th argument of abi encoded `calldata`, which must be a dynamic `bytes`.
+fn abi_bytes_arg(calldata: &[u8], head_index: usize) -> Option<&[u8]> {
+    let args = calldata.get(4..)?;
+    let offset = read_abi_length(args, head_index.checked_mul(32)?)?;
+    let length = read_abi_length(args, offset)?;
+    let start = offset.checked_add(32)?;
+
+    args.get(start..start.checked_add(length)?)
+}
+
+/// Sums the value of the `MultiSend` entries paying `recipient`.
+fn multi_send_value_to(payload: &[u8], recipient: Address) -> Option<U256> {
+    let mut total = U256::ZERO;
+    let mut cursor = 0usize;
+
+    while cursor < payload.len() {
+        let to = Address::from_slice(payload.get(cursor + 1..cursor + 21)?);
+        let value = U256::from_be_slice(payload.get(cursor + 21..cursor + 53)?);
+        let data_length = read_abi_length(payload, cursor + 53)?;
+
+        if to == recipient {
+            total = total.saturating_add(value);
+        }
+
+        cursor = cursor.checked_add(MULTI_SEND_ENTRY_HEADER_LEN)?.checked_add(data_length)?;
+    }
+
+    Some(total)
+}
+
+/// `ExecutionSuccess(bytes32,uint256)`, which a Safe emits only when its inner call succeeded.
+const SAFE_EXECUTION_SUCCESS_TOPIC: B256 =
+    b256!("0x442e715f626346e8c54381002da614f62bee8d27386535b2521ec8540898556e");
+
+/// Whether `safe` reported a successful inner call in these logs.
+fn safe_execution_succeeded(logs: &[alloy_primitives::Log], safe: Address) -> bool {
+    logs.iter().any(|log| {
+        log.address == safe && log.topics().first() == Some(&SAFE_EXECUTION_SUCCESS_TOPIC)
+    })
+}
+
+/// Value the relay's distribution pays `recipient`, or `None` when `input` is not a Safe
+/// `execTransaction` wrapping a `multiSend`.
+fn distribution_value_to(input: &[u8], recipient: Address) -> Option<U256> {
+    if input.get(..4)? != SAFE_EXEC_TRANSACTION_SELECTOR {
+        return None;
+    }
+
+    let inner = abi_bytes_arg(input, 2)?;
+
+    if inner.get(..4)? != MULTI_SEND_SELECTOR {
+        return None;
+    }
+
+    multi_send_value_to(abi_bytes_arg(inner, 0)?, recipient)
+}
+
 /// The type that implements the `validation` rpc namespace trait
 #[derive(Clone, Debug, derive_more::Deref)]
 pub struct ValidationApi<Provider, E: ConfigureEvm, T: PayloadTypes> {
@@ -422,16 +502,18 @@ where
         }
 
         // A merged block pays the proposer across two transactions: the base builder's payment,
-        // which the merge engine verified against the base block before merging onto it, and the
-        // relay's own distribution appended after it. Neither check above can see that. The
-        // balance delta misses it whenever the fee recipient forwards what it receives, and the
-        // shape checks below only ever look at the trailing transaction, which is the
-        // distribution rather than the payment. Only the relay can sign as this address, so its
-        // presence identifies our own block; that the distribution executed is checked above.
+        // wherever merging left it in the block, and the relay's own distribution appended after
+        // it. Neither check above can see that. The balance delta misses it whenever the fee
+        // recipient forwards what it receives.
         if let Some(relay_signer) = *MERGE_RELAY_SIGNER &&
             block.senders_iter().last() == Some(&relay_signer)
         {
-            return Ok(())
+            let credited =
+                self.credited_to_fee_recipient(block, output, message.proposer_fee_recipient);
+
+            return (credited >= message.value)
+                .then_some(())
+                .ok_or(ValidationApiError::ProposerPayment);
         }
 
         let paid_directly =
@@ -462,6 +544,54 @@ where
         }
 
         Ok(())
+    }
+
+    /// Sums what the block credits `fee_recipient` through payment shaped transactions: plain
+    /// transfers, forwarder calls, and the relay's own distribution.
+    fn credited_to_fee_recipient(
+        &self,
+        block: &RecoveredBlock<<E::Primitives as NodePrimitives>::Block>,
+        output: &BlockExecutionOutput<<E::Primitives as NodePrimitives>::Receipt>,
+        fee_recipient: Address,
+    ) -> U256 {
+        let paid_via_forwarder = |to: Address, input: &[u8]| {
+            PAYMENT_FORWARDERS.get(&to).is_some_and(|code_hash| {
+                payment_forwarder_recipient(input) == Some(fee_recipient) &&
+                    self.provider.latest().and_then(|state| state.basic_account(&to)).is_ok_and(
+                        |account| {
+                            account.is_some_and(|account| account.bytecode_hash == Some(*code_hash))
+                        },
+                    )
+            })
+        };
+
+        block
+            .body()
+            .transactions()
+            .iter()
+            .zip(block.senders_iter())
+            .zip(output.receipts.iter())
+            .filter(|((_, sender), receipt)| receipt.status() && **sender != fee_recipient)
+            .map(|((tx, sender), receipt)| {
+                let Some(to) = tx.to() else {
+                    return U256::ZERO;
+                };
+
+                if (to == fee_recipient && tx.input().is_empty()) ||
+                    paid_via_forwarder(to, tx.input())
+                {
+                    return tx.value();
+                }
+
+                if (*MERGE_RELAY_SIGNER).is_some_and(|relay_signer| *sender == relay_signer) &&
+                    safe_execution_succeeded(receipt.logs(), to)
+                {
+                    return distribution_value_to(tx.input(), fee_recipient).unwrap_or(U256::ZERO);
+                }
+
+                U256::ZERO
+            })
+            .fold(U256::ZERO, U256::saturating_add)
     }
 
     /// Validates the given [`BlobsBundleV1`] and returns versioned hashes for blobs.
@@ -931,10 +1061,11 @@ pub(crate) struct ValidationMetrics {
 #[cfg(test)]
 mod tests {
     use super::{
-        hash_disallow_list, parse_payment_forwarders, payment_forwarder_recipient,
-        validate_message_against_payload, AddressSet, BuilderBlockValidationRequestV6,
-        TransactionFilter, ValidationApi, ValidationApiConfig, ValidationApiError,
-        DEFAULT_PAYMENT_FORWARDERS, PAYMENT_FORWARDERS, PAYMENT_FORWARDER_CALLDATA_LEN,
+        distribution_value_to, hash_disallow_list, parse_payment_forwarders,
+        payment_forwarder_recipient, validate_message_against_payload, AddressSet,
+        BuilderBlockValidationRequestV6, TransactionFilter, ValidationApi, ValidationApiConfig,
+        ValidationApiError, DEFAULT_PAYMENT_FORWARDERS, PAYMENT_FORWARDERS,
+        PAYMENT_FORWARDER_CALLDATA_LEN, SAFE_EXECUTION_SUCCESS_TOPIC,
     };
     use alloy_consensus::{BlockHeader, Header, TxEip1559};
     use alloy_eips::{
@@ -1300,6 +1431,49 @@ mod tests {
         let mut input = timestamp.to_be_bytes().to_vec();
         input.extend_from_slice(recipient.as_slice());
         input
+    }
+
+    /// Distribution transactions from merged blocks we delivered to mainnet, as
+    /// `(block number, proposer leg, proposer fee recipient, calldata)`.
+    ///
+    /// The leg is `proposer_value - original_value` as recorded in `merged_block`, so these pin the
+    /// decoder to calldata the relay actually produced.
+    const DELIVERED_DISTRIBUTIONS: [(u64, u64, Address, &str); 3] = [
+        (25953192, 23845723176864, address!("0x8696e84ab5e78983f2456bcb5c199eea9648c8c2"), "0x6a7612020000000000000000000000009641d764fc13c8b624c04430c7356c1c7c8102e2000000000000000000000000000000000000000000000000000041100b93fee0000000000000000000000000000000000000000000000000000000000000014000000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000819eb0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000002c000000000000000000000000000000000000000000000000000000000000001448d80ff0a000000000000000000000000000000000000000000000000000000000000002000000000000000000000000000000000000000000000000000000000000000ff004838b106fce9647bdf1e7877bf73ce8b0bad5f97000000000000000000000000000000000000000000000000000015b003dbffa00000000000000000000000000000000000000000000000000000000000000000008696e84ab5e78983f2456bcb5c199eea9648c8c2000000000000000000000000000000000000000000000000000015b003dbffa00000000000000000000000000000000000000000000000000000000000000000002b3604ded748e848176c045ec701bcf70176b618000000000000000000000000000000000000000000000000000015b003dbffa0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000041ef0e0ff7a017a109d2afe4b3722b26cff9b8ae88d72747e64dfb25a7d4266c353f21a3c5da7650920390990857c86906ec1da7349a064d0a99350bee0a2343231c00000000000000000000000000000000000000000000000000000000000000"),
+        (25953197, 19344068569468, address!("0x388c818ca8b9251b393131c08a736a67ccb19297"), "0x6a7612020000000000000000000000009641d764fc13c8b624c04430c7356c1c7c8102e2000000000000000000000000000000000000000000000000000034c7ad01bc74000000000000000000000000000000000000000000000000000000000000014000000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000cccccc000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000002c000000000000000000000000000000000000000000000000000000000000001448d80ff0a000000000000000000000000000000000000000000000000000000000000002000000000000000000000000000000000000000000000000000000000000000ff002b3604ded748e848176c045ec701bcf70176b61800000000000000000000000000000000000000000000000000001197e455e97c0000000000000000000000000000000000000000000000000000000000000000004838b106fce9647bdf1e7877bf73ce8b0bad5f9700000000000000000000000000000000000000000000000000001197e455e97c000000000000000000000000000000000000000000000000000000000000000000388c818ca8b9251b393131c08a736a67ccb1929700000000000000000000000000000000000000000000000000001197e455e97c0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000417cda46b781c7afecc03786e5c1465545854c5dc07274f35410164278b40a49f2220637705d9109f77ee5bfa0e9c75dcc82238cbb0a372cb9bee12c8f2fbe27451b00000000000000000000000000000000000000000000000000000000000000"),
+        (25953198, 2638279283548, address!("0xcc20850f1907be2aab7474b9819112e37e630d7b"), "0x6a7612020000000000000000000000009641d764fc13c8b624c04430c7356c1c7c8102e200000000000000000000000000000000000000000000000000000732d1193a14000000000000000000000000000000000000000000000000000000000000014000000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000cccccc000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000002c000000000000000000000000000000000000000000000000000000000000001448d80ff0a000000000000000000000000000000000000000000000000000000000000002000000000000000000000000000000000000000000000000000000000000000ff004838b106fce9647bdf1e7877bf73ce8b0bad5f970000000000000000000000000000000000000000000000000000026645b3135c000000000000000000000000000000000000000000000000000000000000000000cc20850f1907be2aab7474b9819112e37e630d7b0000000000000000000000000000000000000000000000000000026645b3135c0000000000000000000000000000000000000000000000000000000000000000002b3604ded748e848176c045ec701bcf70176b6180000000000000000000000000000000000000000000000000000026645b3135c000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000041155b1c3bb73f3b97c524ef4672208553221b24b5c9ffdcee7fc374722e9d45b14e91960c5602d6827584f8a4eb26dc6abddd73b430e91c71642f25ff711596da1b00000000000000000000000000000000000000000000000000000000000000"),
+    ];
+
+    #[test]
+    fn distribution_value_to_reads_delivered_merged_blocks() {
+        for (block_number, proposer_leg, fee_recipient, calldata) in DELIVERED_DISTRIBUTIONS {
+            let calldata = alloy_primitives::hex::decode(calldata).unwrap();
+
+            assert_eq!(
+                distribution_value_to(&calldata, fee_recipient),
+                Some(U256::from(proposer_leg)),
+                "block {block_number}"
+            );
+        }
+    }
+
+    /// The relay signs the same distribution to the base builder and to itself, so a recipient that
+    /// was not part of it has to read as nothing rather than as somebody else's leg.
+    #[test]
+    fn distribution_value_to_is_zero_for_a_bystander_of_a_delivered_block() {
+        let (block_number, _, _, calldata) = DELIVERED_DISTRIBUTIONS[0];
+        let calldata = alloy_primitives::hex::decode(calldata).unwrap();
+
+        assert_eq!(
+            distribution_value_to(&calldata, Address::from([0xAB; 20])),
+            Some(U256::ZERO),
+            "block {block_number}"
+        );
+    }
+
+    #[test]
+    fn safe_execution_success_topic_matches_the_event_signature() {
+        assert_eq!(SAFE_EXECUTION_SUCCESS_TOPIC, keccak256("ExecutionSuccess(bytes32,uint256)"));
     }
 
     /// The runtime deployed at `DEFAULT_PAYMENT_FORWARDERS[0]`, whose hash the entry pins.
