@@ -661,3 +661,9 @@ vergen-git2 = "10.0.1"
 
 # networking
 ipnet = "2.11"
+
+[patch.crates-io]
+# alloy fork carrying the EIP-8282 builder request types, ExecutionRequestsV5 and
+# SignedBidSubmissionV7; drop once upstreamed to alloy-rs/alloy.
+alloy-rpc-types-beacon = { git = "https://github.com/ultrasoundmoney/alloy", branch = "christian/us-1545-eip8282-execution-requests" }
+alloy-eips = { git = "https://github.com/ultrasoundmoney/alloy", branch = "christian/us-1545-eip8282-execution-requests" }

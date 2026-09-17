@@ -49,7 +49,7 @@ alloy-consensus.workspace = true
 alloy-signer.workspace = true
 alloy-signer-local = { workspace = true, features = ["mnemonic"] }
 alloy-eip7928 = { workspace = true, features = ["rlp"] }
-alloy-eips = { workspace = true, features = ["kzg"] }
+alloy-eips = { workspace = true, features = ["kzg", "sha2"] }
 alloy-dyn-abi.workspace = true
 alloy-genesis.workspace = true
 alloy-network.workspace = true

@@ -4,7 +4,7 @@ use alloy_primitives::Address;
 use alloy_rpc_types_beacon::relay::{
     BuilderBlockValidationRequest, BuilderBlockValidationRequestV2,
     BuilderBlockValidationRequestV3, BuilderBlockValidationRequestV4,
-    BuilderBlockValidationRequestV5, BuilderBlockValidationRequestV6,
+    BuilderBlockValidationRequestV5, BuilderBlockValidationRequestV7,
 };
 use jsonrpsee::proc_macros::rpc;
 use serde::{Deserialize, Serialize};
@@ -30,12 +30,15 @@ pub enum PaymentCheck {
     },
 }
 
-/// [`BuilderBlockValidationRequestV6`] extended with the ultra sound payment-check mode.
+/// [`BuilderBlockValidationRequestV7`] extended with the ultra sound payment-check mode.
+///
+/// V7 generalizes the V6 execution requests field: the Electra-typed object still parses, and
+/// the opaque EIP-7685 form (`["0x03…", …]`) carries the EIP-8282 builder registry requests.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UltraSoundBuilderBlockValidationRequestV6 {
     /// The upstream validation request.
     #[serde(flatten)]
-    pub base: BuilderBlockValidationRequestV6,
+    pub base: BuilderBlockValidationRequestV7,
     /// Which payment check to run for this submission.
     #[serde(default)]
     pub payment_check: PaymentCheck,

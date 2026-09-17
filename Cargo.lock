@@ -268,8 +268,7 @@ dependencies = [
 [[package]]
 name = "alloy-eips"
 version = "2.4.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ca3e76d47e8de277cb55e7e77fa38adde835162fc01cddbe1b258b5e0a86035b"
+source = "git+https://github.com/ultrasoundmoney/alloy?branch=christian%2Fus-1545-eip8282-execution-requests#ae56e0217f08a47e677e4383940f12c5e2b14570"
 dependencies = [
  "alloy-eip2124",
  "alloy-eip2930",
@@ -643,8 +642,7 @@ dependencies = [
 [[package]]
 name = "alloy-rpc-types-beacon"
 version = "2.4.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c20f226662436bbdc221c9156a1f445c257da5e695b39a26878aa8b2644f710e"
+source = "git+https://github.com/ultrasoundmoney/alloy?branch=christian%2Fus-1545-eip8282-execution-requests#ae56e0217f08a47e677e4383940f12c5e2b14570"
 dependencies = [
  "alloy-eips",
  "alloy-primitives",

@@ -847,10 +847,11 @@ mod tests {
         hash_disallow_list, validate_message_against_payload, AddressSet, PaymentCheck,
         UltraSoundBuilderBlockValidationRequestV6, ValidationApiError,
     };
-    use alloy_primitives::{Address, Bytes, B256};
+    use alloy_eips::eip8282::BuilderDepositRequest;
+    use alloy_primitives::{b256, hex, Address, Bytes, FixedBytes, B256};
     use alloy_rpc_types_beacon::{
-        relay::{BidTrace, BuilderBlockValidationRequestV6, SignedBidSubmissionV6},
-        requests::ExecutionRequestsV4,
+        relay::{BidTrace, BuilderBlockValidationRequestV7, SignedBidSubmissionV7},
+        requests::ExecutionRequestsV5,
     };
     use alloy_rpc_types_engine::{
         ExecutionPayload, ExecutionPayloadV1, ExecutionPayloadV2, ExecutionPayloadV3,
@@ -943,11 +944,11 @@ mod tests {
         assert_eq!(mismatch.expected, payload.as_v1().gas_used);
     }
 
-    fn test_v6_request() -> BuilderBlockValidationRequestV6 {
+    fn test_v6_request() -> BuilderBlockValidationRequestV7 {
         let ExecutionPayload::V1(payload_v1) = test_execution_payload() else { unreachable!() };
 
-        BuilderBlockValidationRequestV6 {
-            request: SignedBidSubmissionV6 {
+        BuilderBlockValidationRequestV7 {
+            request: SignedBidSubmissionV7 {
                 message: BidTrace::default(),
                 execution_payload: ExecutionPayloadV4 {
                     payload_inner: ExecutionPayloadV3 {
@@ -962,7 +963,7 @@ mod tests {
                     slot_number: 6,
                 },
                 blobs_bundle: Default::default(),
-                execution_requests: ExecutionRequestsV4::default(),
+                execution_requests: ExecutionRequestsV5::default(),
                 signature: Default::default(),
             },
             registered_gas_limit: 30_000_000,
@@ -1004,6 +1005,53 @@ mod tests {
         let parsed: UltraSoundBuilderBlockValidationRequestV6 =
             serde_json::from_value(json).unwrap();
         assert_eq!(parsed.payment_check, PaymentCheck::Skip);
+    }
+
+    /// EIP-8282 builder deposit requests observed on glamsterdam devnet-8 (relay registry
+    /// topups), reconstructed from the builder deposit predeploy logs of the named blocks.
+    /// The expected hashes are the blocks' on-chain `requestsHash` header fields, so this
+    /// proves the typed representation reproduces the EIP-7685 commitment for real gloas-era
+    /// blocks carrying builder requests.
+    #[test]
+    fn test_devnet8_builder_deposit_requests_hash() {
+        let pubkey = FixedBytes::from(hex!(
+            "a44d606ec070d7252f1fdbff753ae5913615f0d323b93dd403ad99d2706b4bcfd96d258a4327538acb6282e1ae7397ed"
+        ));
+        let withdrawal_credentials =
+            b256!("b00000000000000000000000a4449f1cfb6476994842c346fad9ec7cd15380bd");
+
+        let cases = [
+            // block 210258
+            (
+                91_000_000_000u64,
+                hex!(
+                    "95a3bb94fbf447868213462857b574bb840f4299b4e603c3016f9a86b23086395d43d13be362c1e9179c82d28415e0eb044300f5f2d1c90ddf446eea31e279de0c9d3163a7fef26742e4c0952a03306319d2a87bd0cbd7c1100ca0e6ee5e747a"
+                ),
+                b256!("1c85a255985080d1ee0ae90ed6e4825ab75e64b316783684ea83c1d9709cf6af"),
+            ),
+            // block 216118
+            (
+                500_000_000_000u64,
+                hex!(
+                    "ae171b037a065264d90d2eee298f54a2e13465b18b171457fc4e2714fd8b687415c8eae08e4750f0829a03277523ff730a1198df2b4272062fafaa024f7a106794f21534754919f0ea8f3811dec78d951198da3badf9f853563b46cf2c83b6a3"
+                ),
+                b256!("79b08a123c1a895a75b0dd2edf13667ff1a71c442baa729040363a408afa1b15"),
+            ),
+        ];
+
+        for (amount, signature, expected_requests_hash) in cases {
+            let requests = ExecutionRequestsV5 {
+                builder_deposits: vec![BuilderDepositRequest {
+                    pubkey,
+                    withdrawal_credentials,
+                    amount,
+                    signature: FixedBytes::from(signature),
+                }],
+                ..Default::default()
+            };
+
+            assert_eq!(requests.to_requests().requests_hash(), expected_requests_hash);
+        }
     }
 
     #[test]
