@@ -7,7 +7,7 @@ use alloy_primitives::{map::AddressSet, Address, B256, U256};
 use alloy_rpc_types_beacon::relay::{
     BidTrace, BuilderBlockValidationRequest, BuilderBlockValidationRequestV2,
     BuilderBlockValidationRequestV3, BuilderBlockValidationRequestV4,
-    BuilderBlockValidationRequestV5, BuilderBlockValidationRequestV6,
+    BuilderBlockValidationRequestV5,
 };
 use alloy_rpc_types_engine::{
     BlobsBundleV1, BlobsBundleV2, CancunPayloadFields, ExecutionData, ExecutionPayload,
@@ -34,7 +34,9 @@ use reth_primitives_traits::{
     BlockBody, GotExpected, NodePrimitives, RecoveredBlock, SealedBlock, SealedHeaderFor,
 };
 use reth_revm::{cached::CachedReads, database::StateProviderDatabase};
-use reth_rpc_api::BlockSubmissionValidationApiServer;
+use reth_rpc_api::{
+    BlockSubmissionValidationApiServer, PaymentCheck, UltraSoundBuilderBlockValidationRequestV6,
+};
 use reth_rpc_server_types::result::{internal_rpc_err, invalid_params_rpc_err};
 use reth_storage_api::{BlockReaderIdExt, HashedPostStateProvider, StateProviderFactory};
 use reth_tasks::Runtime;
@@ -127,6 +129,7 @@ where
         message: BidTrace,
         registered_gas_limit: u64,
         decoded_bal: Option<DecodedBal>,
+        payment_check: PaymentCheck,
     ) -> Result<(), ValidationApiError> {
         self.validate_message_against_header(block.sealed_header(), &message)?;
 
@@ -233,7 +236,13 @@ where
             block_access_list_hash,
         )?;
 
-        self.ensure_payment(&block, &output, &message)?;
+        match payment_check {
+            PaymentCheck::Proposer => self.ensure_payment(&block, &output, &message)?,
+            PaymentCheck::Skip => {}
+            PaymentCheck::LastTxStrict { recipient } => {
+                self.ensure_last_tx_payment(&block, &output, &message, recipient)?
+            }
+        }
 
         let hashed_state = state_provider.hashed_post_state(&output.state)?;
         let state_root = state_provider.state_root(hashed_state)?;
@@ -345,6 +354,32 @@ where
         Ok(())
     }
 
+    /// Ensures that the payload's last transaction pays `recipient` exactly the bid value.
+    ///
+    /// Fully mediated gloas bids: the relay pays the proposer from its own stake and the builder
+    /// pays the relay wallet inside the payload. The builder constructs the payment transaction,
+    /// so a value mismatch has no legitimate cause and the check is strict equality rather than
+    /// the `>=` of the proposer-payment path.
+    fn ensure_last_tx_payment(
+        &self,
+        block: &SealedBlock<<E::Primitives as NodePrimitives>::Block>,
+        output: &BlockExecutionOutput<<E::Primitives as NodePrimitives>::Receipt>,
+        message: &BidTrace,
+        recipient: Address,
+    ) -> Result<(), ValidationApiError> {
+        let (receipt, tx) = output
+            .receipts
+            .last()
+            .zip(block.body().transactions().last())
+            .ok_or(ValidationApiError::RelayPayment)?;
+
+        if !receipt.status() || tx.to() != Some(recipient) || tx.value() != message.value {
+            return Err(ValidationApiError::RelayPayment)
+        }
+
+        Ok(())
+    }
+
     /// Validates the given [`BlobsBundleV1`] and returns versioned hashes for blobs.
     pub fn validate_blobs_bundle(
         &self,
@@ -389,6 +424,7 @@ where
             request.request.message,
             request.registered_gas_limit,
             None,
+            PaymentCheck::Proposer,
         )
         .await
     }
@@ -418,6 +454,7 @@ where
             request.request.message,
             request.registered_gas_limit,
             None,
+            PaymentCheck::Proposer,
         )
         .await
     }
@@ -463,6 +500,7 @@ where
             request.request.message,
             request.registered_gas_limit,
             None,
+            PaymentCheck::Proposer,
         )
         .await
     }
@@ -470,8 +508,11 @@ where
     /// Core logic for validating the builder submission v6
     async fn validate_builder_submission_v6(
         &self,
-        request: BuilderBlockValidationRequestV6,
+        request: UltraSoundBuilderBlockValidationRequestV6,
     ) -> Result<(), ValidationApiError> {
+        let payment_check = request.payment_check;
+        let request = request.base;
+
         let payload = ExecutionPayload::V4(request.request.execution_payload);
         validate_message_against_payload(&request.request.message, &payload)?;
 
@@ -511,6 +552,7 @@ where
             request.request.message,
             request.registered_gas_limit,
             Some(decoded_bal),
+            payment_check,
         )
         .await
     }
@@ -600,7 +642,7 @@ where
     /// Validates a block submitted to the relay
     async fn validate_builder_submission_v6(
         &self,
-        request: BuilderBlockValidationRequestV6,
+        request: UltraSoundBuilderBlockValidationRequestV6,
     ) -> RpcResult<()> {
         let this = self.clone();
         let (tx, rx) = oneshot::channel();
@@ -734,6 +776,8 @@ pub enum ValidationApiError {
     BlockTooOld,
     #[error("could not verify proposer payment")]
     ProposerPayment,
+    #[error("payload's last transaction does not pay the relay wallet exactly the bid value")]
+    RelayPayment,
     #[error("invalid blobs bundle")]
     InvalidBlobsBundle,
     #[error("invalid block access list: {_0}")]
@@ -761,6 +805,7 @@ impl From<ValidationApiError> for ErrorObject<'static> {
             ValidationApiError::BlockHashMismatch(_) |
             ValidationApiError::Blacklist(_) |
             ValidationApiError::ProposerPayment |
+            ValidationApiError::RelayPayment |
             ValidationApiError::InvalidBlobsBundle |
             ValidationApiError::InvalidBlockAccessList(_) |
             ValidationApiError::Blob(_) => invalid_params_rpc_err(error.to_string()),
@@ -799,11 +844,18 @@ pub(crate) struct ValidationMetrics {
 #[cfg(test)]
 mod tests {
     use super::{
-        hash_disallow_list, validate_message_against_payload, AddressSet, ValidationApiError,
+        hash_disallow_list, validate_message_against_payload, AddressSet, PaymentCheck,
+        UltraSoundBuilderBlockValidationRequestV6, ValidationApiError,
     };
-    use alloy_primitives::{Address, B256};
-    use alloy_rpc_types_beacon::relay::BidTrace;
-    use alloy_rpc_types_engine::{ExecutionPayload, ExecutionPayloadV1};
+    use alloy_primitives::{Address, Bytes, B256};
+    use alloy_rpc_types_beacon::{
+        relay::{BidTrace, BuilderBlockValidationRequestV6, SignedBidSubmissionV6},
+        requests::ExecutionRequestsV4,
+    };
+    use alloy_rpc_types_engine::{
+        ExecutionPayload, ExecutionPayloadV1, ExecutionPayloadV2, ExecutionPayloadV3,
+        ExecutionPayloadV4,
+    };
 
     fn test_execution_payload() -> ExecutionPayload {
         ExecutionPayload::V1(ExecutionPayloadV1 {
@@ -889,6 +941,69 @@ mod tests {
         };
         assert_eq!(mismatch.got, message.gas_used);
         assert_eq!(mismatch.expected, payload.as_v1().gas_used);
+    }
+
+    fn test_v6_request() -> BuilderBlockValidationRequestV6 {
+        let ExecutionPayload::V1(payload_v1) = test_execution_payload() else { unreachable!() };
+
+        BuilderBlockValidationRequestV6 {
+            request: SignedBidSubmissionV6 {
+                message: BidTrace::default(),
+                execution_payload: ExecutionPayloadV4 {
+                    payload_inner: ExecutionPayloadV3 {
+                        payload_inner: ExecutionPayloadV2 {
+                            payload_inner: payload_v1,
+                            withdrawals: Vec::new(),
+                        },
+                        blob_gas_used: 0,
+                        excess_blob_gas: 0,
+                    },
+                    block_access_list: Bytes::from_static(&[0xaa, 0xbb]),
+                    slot_number: 6,
+                },
+                blobs_bundle: Default::default(),
+                execution_requests: ExecutionRequestsV4::default(),
+                signature: Default::default(),
+            },
+            registered_gas_limit: 30_000_000,
+            parent_beacon_block_root: B256::ZERO,
+        }
+    }
+
+    #[test]
+    fn test_v6_payment_check_defaults_to_proposer() {
+        let base = test_v6_request();
+        let json = serde_json::to_value(&base).unwrap();
+
+        let parsed: UltraSoundBuilderBlockValidationRequestV6 =
+            serde_json::from_value(json).unwrap();
+        assert_eq!(parsed.payment_check, PaymentCheck::Proposer);
+        assert_eq!(parsed.base, base);
+    }
+
+    #[test]
+    fn test_v6_payment_check_last_tx_strict_roundtrip() {
+        let request = UltraSoundBuilderBlockValidationRequestV6 {
+            base: test_v6_request(),
+            payment_check: PaymentCheck::LastTxStrict { recipient: Address::repeat_byte(0x42) },
+        };
+
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(json["payment_check"]["mode"], "last_tx_strict");
+
+        let parsed: UltraSoundBuilderBlockValidationRequestV6 =
+            serde_json::from_value(json).unwrap();
+        assert_eq!(parsed, request);
+    }
+
+    #[test]
+    fn test_v6_payment_check_skip_parses() {
+        let mut json = serde_json::to_value(test_v6_request()).unwrap();
+        json["payment_check"] = serde_json::json!({ "mode": "skip" });
+
+        let parsed: UltraSoundBuilderBlockValidationRequestV6 =
+            serde_json::from_value(json).unwrap();
+        assert_eq!(parsed.payment_check, PaymentCheck::Skip);
     }
 
     #[test]
