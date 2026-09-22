@@ -1569,6 +1569,89 @@ mod tests {
         )
     }
 
+    /// Returns the prepared block regardless of the payload, so a V6 request can be driven
+    /// through [`ValidationApi::validate_builder_submission_v6`] without building a payload that
+    /// converts.
+    #[derive(Debug)]
+    struct FixedBlockPayloadValidator(SealedBlock<Block>);
+
+    impl PayloadValidator<EthPayloadTypes> for FixedBlockPayloadValidator {
+        type Block = Block;
+
+        fn convert_payload_to_block(
+            &self,
+            _payload: ExecutionData,
+        ) -> Result<SealedBlock<Self::Block>, NewPayloadError> {
+            Ok(self.0.clone())
+        }
+    }
+
+    /// A V6 submission carrying one transaction, with the sender's address returned so it can be
+    /// put on the disallow list.
+    fn v6_submission_with_one_sender(
+    ) -> (MockEthProvider, BuilderBlockValidationRequestV6, SealedBlock<Block>, Address) {
+        let provider = MockEthProvider::default();
+
+        let parent = SealedHeader::seal_slow(Header { gas_limit: 30_000_000, ..Default::default() });
+        provider.add_block(
+            parent.hash(),
+            Block { header: parent.clone_header(), body: Default::default() },
+        );
+
+        let mut rng = generators::rng();
+        let key = generators::generate_key(&mut rng);
+        let sender = public_key_to_address(key.public_key());
+        let tx = generators::sign_tx_with_key_pair(
+            key,
+            Transaction::Eip1559(TxEip1559 {
+                chain_id: 1,
+                nonce: 0,
+                gas_limit: 21_000,
+                max_fee_per_gas: 0,
+                max_priority_fee_per_gas: 0,
+                to: TxKind::Call(Address::repeat_byte(0x99)),
+                value: U256::ZERO,
+                ..Default::default()
+            }),
+        );
+
+        let header = Header {
+            parent_hash: parent.hash(),
+            number: parent.number() + 1,
+            gas_limit: parent.gas_limit(),
+            timestamp: parent.timestamp() + 12,
+            ..Default::default()
+        };
+        let block = SealedBlock::seal_slow(Block {
+            header,
+            body: BlockBody { transactions: vec![tx], ..Default::default() },
+        });
+
+        let mut request = test_v6_request();
+        request.registered_gas_limit = block.gas_limit();
+        // The V6 handler decodes the block access list before anything else, so it has to be
+        // well-formed RLP; an empty list is enough here.
+        request.request.execution_payload.block_access_list = Bytes::from_static(&[0xc0]);
+
+        let payload = &mut request.request.execution_payload.payload_inner.payload_inner;
+        payload.payload_inner.parent_hash = block.parent_hash();
+        payload.payload_inner.block_hash = block.hash();
+        payload.payload_inner.gas_limit = block.gas_limit();
+        payload.payload_inner.gas_used = block.gas_used();
+
+        request.request.message = BidTrace {
+            parent_hash: block.parent_hash(),
+            block_hash: block.hash(),
+            gas_limit: block.gas_limit(),
+            gas_used: block.gas_used(),
+            ..Default::default()
+        };
+
+        provider.state_roots.lock().push(block.state_root());
+
+        (provider, request, block, sender)
+    }
+
     /// A submission whose payload pays the proposer nothing, like a trustless ePBS bid: there the
     /// payment settles from the builder's stake on the consensus layer.
     fn payment_free_submission() -> (MockEthProvider, RecoveredBlock<Block>, BidTrace) {
@@ -1660,6 +1743,55 @@ mod tests {
         test_validation_api(provider)
             .ensure_payment(&block, &output, &message)
             .unwrap();
+    }
+
+    fn v6_validation_api(
+        provider: MockEthProvider,
+        block: SealedBlock<Block>,
+        disallow: AddressSet,
+    ) -> ValidationApi<MockEthProvider, EthEvmConfig, EthPayloadTypes> {
+        ValidationApi::new(
+            provider,
+            NoopConsensus::arc(),
+            EthEvmConfig::mainnet(),
+            ValidationApiConfig { disallow, ..Default::default() },
+            Runtime::test(),
+            Arc::new(FixedBlockPayloadValidator(block)),
+        )
+    }
+
+    /// The relay sends `transaction_filter` on every submission version, so the V6 handler has to
+    /// honour it: a submission whose only transaction comes from a disallowed sender must be
+    /// rejected when the request asks for OFAC filtering.
+    #[tokio::test]
+    async fn test_v6_applies_the_ofac_transaction_filter() {
+        let (provider, mut request, block, sender) = v6_submission_with_one_sender();
+        request.transaction_filter = TransactionFilter::OFAC;
+
+        let err = v6_validation_api(provider, block, AddressSet::from_iter([sender]))
+            .validate_builder_submission_v6(request)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, ValidationApiError::Blacklist(address) if address == sender),
+            "unexpected error: {err}");
+    }
+
+    /// The counterpart: the same submission, the same disallow list, filtering off. The sender
+    /// must get past the blacklist, so the rejection above is the filter and not the fixture.
+    #[tokio::test]
+    async fn test_v6_skips_the_filter_when_not_requested() {
+        let (provider, mut request, block, sender) = v6_submission_with_one_sender();
+        request.transaction_filter = TransactionFilter::None;
+
+        let result = v6_validation_api(provider, block, AddressSet::from_iter([sender]))
+            .validate_builder_submission_v6(request)
+            .await;
+
+        assert!(
+            !matches!(result, Err(ValidationApiError::Blacklist(_))),
+            "the disallow list was consulted without the filter: {result:?}"
+        );
     }
 
     /// Execution state for a block in which `address` ended up poorer than it started.
