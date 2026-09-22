@@ -7,7 +7,7 @@ use alloy_primitives::{map::AddressSet, Address, B256, U256};
 use alloy_rpc_types_beacon::relay::{
     BidTrace, BuilderBlockValidationRequest, BuilderBlockValidationRequestV2,
     BuilderBlockValidationRequestV3, BuilderBlockValidationRequestV4,
-    BuilderBlockValidationRequestV5, BuilderBlockValidationRequestV6,
+    BuilderBlockValidationRequestV5,
 };
 use alloy_rpc_types_engine::{
     BlobsBundleV1, BlobsBundleV2, CancunPayloadFields, ExecutionData, ExecutionPayload,
@@ -34,7 +34,7 @@ use reth_primitives_traits::{
     BlockBody, GotExpected, NodePrimitives, RecoveredBlock, SealedBlock, SealedHeaderFor,
 };
 use reth_revm::{cached::CachedReads, database::StateProviderDatabase};
-use reth_rpc_api::BlockSubmissionValidationApiServer;
+use reth_rpc_api::{BlockSubmissionValidationApiServer, BuilderBlockValidationRequestV6Ext};
 use reth_rpc_server_types::result::{internal_rpc_err, invalid_params_rpc_err};
 use reth_storage_api::{BlockReaderIdExt, HashedPostStateProvider, StateProviderFactory};
 use reth_tasks::Runtime;
@@ -127,6 +127,7 @@ where
         message: BidTrace,
         registered_gas_limit: u64,
         decoded_bal: Option<DecodedBal>,
+        skip_payment_check: bool,
     ) -> Result<(), ValidationApiError> {
         self.validate_message_against_header(block.sealed_header(), &message)?;
 
@@ -233,7 +234,9 @@ where
             block_access_list_hash,
         )?;
 
-        self.ensure_payment(&block, &output, &message)?;
+        if !skip_payment_check {
+            self.ensure_payment(&block, &output, &message)?;
+        }
 
         let hashed_state = state_provider.hashed_post_state(&output.state)?;
         let state_root = state_provider.state_root(hashed_state)?;
@@ -389,6 +392,7 @@ where
             request.request.message,
             request.registered_gas_limit,
             None,
+            false,
         )
         .await
     }
@@ -418,6 +422,7 @@ where
             request.request.message,
             request.registered_gas_limit,
             None,
+            false,
         )
         .await
     }
@@ -463,6 +468,7 @@ where
             request.request.message,
             request.registered_gas_limit,
             None,
+            false,
         )
         .await
     }
@@ -470,8 +476,10 @@ where
     /// Core logic for validating the builder submission v6
     async fn validate_builder_submission_v6(
         &self,
-        request: BuilderBlockValidationRequestV6,
+        request: BuilderBlockValidationRequestV6Ext,
     ) -> Result<(), ValidationApiError> {
+        let BuilderBlockValidationRequestV6Ext { request, skip_payment_check } = request;
+
         let payload = ExecutionPayload::V4(request.request.execution_payload);
         validate_message_against_payload(&request.request.message, &payload)?;
 
@@ -511,6 +519,7 @@ where
             request.request.message,
             request.registered_gas_limit,
             Some(decoded_bal),
+            skip_payment_check,
         )
         .await
     }
@@ -600,7 +609,7 @@ where
     /// Validates a block submitted to the relay
     async fn validate_builder_submission_v6(
         &self,
-        request: BuilderBlockValidationRequestV6,
+        request: BuilderBlockValidationRequestV6Ext,
     ) -> RpcResult<()> {
         let this = self.clone();
         let (tx, rx) = oneshot::channel();
@@ -799,11 +808,28 @@ pub(crate) struct ValidationMetrics {
 #[cfg(test)]
 mod tests {
     use super::{
-        hash_disallow_list, validate_message_against_payload, AddressSet, ValidationApiError,
+        hash_disallow_list, validate_message_against_payload, AddressSet,
+        BuilderBlockValidationRequestV6Ext, ValidationApi, ValidationApiConfig, ValidationApiError,
     };
-    use alloy_primitives::{Address, B256};
-    use alloy_rpc_types_beacon::relay::BidTrace;
-    use alloy_rpc_types_engine::{ExecutionPayload, ExecutionPayloadV1};
+    use alloy_consensus::{BlockHeader, Header};
+    use alloy_primitives::{Address, Bytes, B256, U256};
+    use alloy_rpc_types_beacon::relay::{
+        BidTrace, BuilderBlockValidationRequestV6, SignedBidSubmissionV6,
+    };
+    use alloy_rpc_types_engine::{
+        ExecutionData, ExecutionPayload, ExecutionPayloadV1, ExecutionPayloadV2,
+        ExecutionPayloadV3, ExecutionPayloadV4,
+    };
+    use reth_consensus::noop::NoopConsensus;
+    use reth_engine_primitives::PayloadValidator;
+    use reth_ethereum_engine_primitives::EthPayloadTypes;
+    use reth_ethereum_primitives::Block;
+    use reth_evm_ethereum::EthEvmConfig;
+    use reth_node_api::NewPayloadError;
+    use reth_primitives_traits::{RecoveredBlock, SealedBlock, SealedHeader};
+    use reth_provider::test_utils::MockEthProvider;
+    use reth_tasks::Runtime;
+    use std::sync::Arc;
 
     fn test_execution_payload() -> ExecutionPayload {
         ExecutionPayload::V1(ExecutionPayloadV1 {
@@ -942,5 +968,152 @@ mod tests {
         let expected_hash = "ee14e9d115e182f61871a5a385ab2f32ecf434f3b17bdbacc71044810d89e608";
         let hash = hash_disallow_list(&blocklist);
         assert_eq!(expected_hash, hash);
+    }
+
+    /// Only [`ValidationApi::validate_message_against_block`] is exercised below, which never
+    /// converts a payload.
+    #[derive(Debug)]
+    struct UnusedPayloadValidator;
+
+    impl PayloadValidator<EthPayloadTypes> for UnusedPayloadValidator {
+        type Block = Block;
+
+        fn convert_payload_to_block(
+            &self,
+            _payload: ExecutionData,
+        ) -> Result<SealedBlock<Self::Block>, NewPayloadError> {
+            unimplemented!()
+        }
+    }
+
+    fn test_validation_api(
+        provider: MockEthProvider,
+    ) -> ValidationApi<MockEthProvider, EthEvmConfig, EthPayloadTypes> {
+        ValidationApi::new(
+            provider,
+            NoopConsensus::arc(),
+            EthEvmConfig::mainnet(),
+            ValidationApiConfig::default(),
+            Runtime::test(),
+            Arc::new(UnusedPayloadValidator),
+        )
+    }
+
+    /// A submission whose payload pays the proposer nothing, like a trustless ePBS bid: there the
+    /// payment settles from the builder's stake on the consensus layer.
+    fn payment_free_submission() -> (MockEthProvider, RecoveredBlock<Block>, BidTrace) {
+        let provider = MockEthProvider::default();
+
+        let parent = Header { gas_limit: 30_000_000, ..Default::default() };
+        let parent = SealedHeader::seal_slow(parent);
+        provider.add_block(
+            parent.hash(),
+            Block { header: parent.clone_header(), body: Default::default() },
+        );
+
+        let header = Header {
+            parent_hash: parent.hash(),
+            number: parent.number() + 1,
+            gas_limit: parent.gas_limit(),
+            timestamp: parent.timestamp() + 12,
+            ..Default::default()
+        };
+        let block = SealedBlock::seal_slow(Block { header, body: Default::default() })
+            .try_recover()
+            .unwrap();
+        provider.state_roots.lock().push(block.state_root());
+
+        let message = BidTrace {
+            parent_hash: block.parent_hash(),
+            block_hash: block.hash(),
+            gas_limit: block.gas_limit(),
+            gas_used: block.gas_used(),
+            proposer_fee_recipient: Address::repeat_byte(0x42),
+            value: U256::from(1_000_000_000_000_000_000u64),
+            ..Default::default()
+        };
+
+        (provider, block, message)
+    }
+
+    #[tokio::test]
+    async fn test_payment_check_runs_by_default() {
+        let (provider, block, message) = payment_free_submission();
+        let registered_gas_limit = block.gas_limit();
+
+        let err = test_validation_api(provider)
+            .validate_message_against_block(block, message, registered_gas_limit, None, false)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, ValidationApiError::ProposerPayment), "unexpected error: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_payment_check_skipped_on_request() {
+        let (provider, block, message) = payment_free_submission();
+        let registered_gas_limit = block.gas_limit();
+
+        test_validation_api(provider)
+            .validate_message_against_block(block, message, registered_gas_limit, None, true)
+            .await
+            .unwrap();
+    }
+
+    fn test_v6_request() -> BuilderBlockValidationRequestV6 {
+        let ExecutionPayload::V1(payload_inner) = test_execution_payload() else { unreachable!() };
+
+        BuilderBlockValidationRequestV6 {
+            request: SignedBidSubmissionV6 {
+                message: BidTrace::default(),
+                execution_payload: ExecutionPayloadV4 {
+                    payload_inner: ExecutionPayloadV3 {
+                        payload_inner: ExecutionPayloadV2 {
+                            payload_inner,
+                            withdrawals: Vec::new(),
+                        },
+                        blob_gas_used: 0,
+                        excess_blob_gas: 0,
+                    },
+                    block_access_list: Bytes::from_static(&[0xaa, 0xbb]),
+                    slot_number: 6,
+                },
+                blobs_bundle: Default::default(),
+                execution_requests: Default::default(),
+                signature: Default::default(),
+            },
+            registered_gas_limit: 30_000_000,
+            parent_beacon_block_root: B256::ZERO,
+        }
+    }
+
+    /// The extension is wire compatible: a request that predates it still deserializes, and
+    /// leaves the payment check on.
+    #[test]
+    fn test_v6_request_without_skip_payment_check() {
+        let request = test_v6_request();
+        let json = serde_json::to_value(&request).unwrap();
+        assert!(json.get("skip_payment_check").is_none());
+
+        let ext: BuilderBlockValidationRequestV6Ext = serde_json::from_value(json).unwrap();
+
+        assert!(!ext.skip_payment_check);
+        assert_eq!(ext.request, request);
+    }
+
+    #[test]
+    fn test_v6_request_with_skip_payment_check() {
+        let ext = BuilderBlockValidationRequestV6Ext {
+            request: test_v6_request(),
+            skip_payment_check: true,
+        };
+
+        let json = serde_json::to_value(&ext).unwrap();
+        assert_eq!(json["skip_payment_check"], true);
+
+        assert_eq!(
+            serde_json::from_value::<BuilderBlockValidationRequestV6Ext>(json).unwrap(),
+            ext
+        );
     }
 }
