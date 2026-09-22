@@ -808,8 +808,12 @@ mod tests {
         ValidationApiConfig, ValidationApiError,
     };
     use alloy_consensus::{BlockHeader, Header};
-    use alloy_primitives::{Address, B256, U256};
-    use alloy_rpc_types_beacon::relay::BidTrace;
+    use alloy_eips::{
+        eip7002::WithdrawalRequest,
+        eip8282::{BuilderDepositRequest, BuilderExitRequest},
+    };
+    use alloy_primitives::{address, b256, hex, Address, FixedBytes, B256, U256};
+    use alloy_rpc_types_beacon::{relay::BidTrace, requests::ExecutionRequestsV5};
     use alloy_rpc_types_engine::{ExecutionData, ExecutionPayload, ExecutionPayloadV1};
     use reth_consensus::noop::NoopConsensus;
     use reth_engine_primitives::PayloadValidator;
@@ -909,6 +913,179 @@ mod tests {
         };
         assert_eq!(mismatch.got, message.gas_used);
         assert_eq!(mismatch.expected, payload.as_v1().gas_used);
+    }
+
+    /// EIP-8282 builder deposit requests observed on glamsterdam devnet-8 (relay registry
+    /// topups), reconstructed from the builder deposit predeploy logs of the named blocks.
+    /// The expected hashes are the blocks' on-chain `requestsHash` header fields, so this
+    /// proves the typed representation reproduces the EIP-7685 commitment for real gloas-era
+    /// blocks carrying builder requests.
+    #[test]
+    fn test_devnet8_builder_deposit_requests_hash() {
+        let pubkey = FixedBytes::from(hex!(
+            "a44d606ec070d7252f1fdbff753ae5913615f0d323b93dd403ad99d2706b4bcfd96d258a4327538acb6282e1ae7397ed"
+        ));
+        let withdrawal_credentials =
+            b256!("b00000000000000000000000a4449f1cfb6476994842c346fad9ec7cd15380bd");
+
+        let cases = [
+            // block 210258
+            (
+                91_000_000_000u64,
+                hex!(
+                    "95a3bb94fbf447868213462857b574bb840f4299b4e603c3016f9a86b23086395d43d13be362c1e9179c82d28415e0eb044300f5f2d1c90ddf446eea31e279de0c9d3163a7fef26742e4c0952a03306319d2a87bd0cbd7c1100ca0e6ee5e747a"
+                ),
+                b256!("1c85a255985080d1ee0ae90ed6e4825ab75e64b316783684ea83c1d9709cf6af"),
+            ),
+            // block 216118
+            (
+                500_000_000_000u64,
+                hex!(
+                    "ae171b037a065264d90d2eee298f54a2e13465b18b171457fc4e2714fd8b687415c8eae08e4750f0829a03277523ff730a1198df2b4272062fafaa024f7a106794f21534754919f0ea8f3811dec78d951198da3badf9f853563b46cf2c83b6a3"
+                ),
+                b256!("79b08a123c1a895a75b0dd2edf13667ff1a71c442baa729040363a408afa1b15"),
+            ),
+        ];
+
+        for (amount, signature, expected_requests_hash) in cases {
+            let requests = ExecutionRequestsV5 {
+                builder_deposits: vec![BuilderDepositRequest {
+                    pubkey,
+                    withdrawal_credentials,
+                    amount,
+                    signature: FixedBytes::from(signature),
+                }],
+                ..Default::default()
+            };
+
+            assert_eq!(requests.to_requests().requests_hash(), expected_requests_hash);
+        }
+    }
+
+    /// Builder pubkey of the relay's devnet-8 registry entry, reused by the builder-exit cases
+    /// below so they exercise realistically shaped (not repeat-byte) inputs.
+    fn devnet8_builder_pubkey() -> FixedBytes<48> {
+        FixedBytes::from(hex!(
+            "a44d606ec070d7252f1fdbff753ae5913615f0d323b93dd403ad99d2706b4bcfd96d258a4327538acb6282e1ae7397ed"
+        ))
+    }
+
+    /// Withdrawal address embedded in the relay's `0xb0…` builder withdrawal credentials, which
+    /// is also the address that would submit a builder exit for that entry.
+    fn devnet8_builder_source_address() -> Address {
+        address!("0xa4449f1cfb6476994842c346fad9ec7cd15380bd")
+    }
+
+    fn devnet8_builder_deposits() -> Vec<BuilderDepositRequest> {
+        let withdrawal_credentials =
+            b256!("b00000000000000000000000a4449f1cfb6476994842c346fad9ec7cd15380bd");
+
+        vec![
+            BuilderDepositRequest {
+                pubkey: devnet8_builder_pubkey(),
+                withdrawal_credentials,
+                amount: 91_000_000_000,
+                signature: FixedBytes::from(hex!(
+                    "95a3bb94fbf447868213462857b574bb840f4299b4e603c3016f9a86b23086395d43d13be362c1e9179c82d28415e0eb044300f5f2d1c90ddf446eea31e279de0c9d3163a7fef26742e4c0952a03306319d2a87bd0cbd7c1100ca0e6ee5e747a"
+                )),
+            },
+            BuilderDepositRequest {
+                pubkey: FixedBytes::repeat_byte(0xb0),
+                withdrawal_credentials,
+                amount: 500_000_000_000,
+                signature: FixedBytes::from(hex!(
+                    "ae171b037a065264d90d2eee298f54a2e13465b18b171457fc4e2714fd8b687415c8eae08e4750f0829a03277523ff730a1198df2b4272062fafaa024f7a106794f21534754919f0ea8f3811dec78d951198da3badf9f853563b46cf2c83b6a3"
+                )),
+            },
+        ]
+    }
+
+    /// No devnet block has carried a builder exit (`0x04`) yet, so the expected commitments here
+    /// come from an independent reimplementation of the EIP-7685 hash (SSZ fixed-size container
+    /// concatenation, then `sha256(concat(sha256(type || data)))` over non-empty requests only)
+    /// that was first checked against the two real on-chain hashes asserted in
+    /// [`test_devnet8_builder_deposit_requests_hash`]. Exercising exits this way still pins the
+    /// `0x04` type byte, the 68-byte `source_address ++ pubkey` layout and the list ordering.
+    #[test]
+    fn test_builder_exit_requests_hash() {
+        let requests = ExecutionRequestsV5 {
+            builder_exits: vec![BuilderExitRequest {
+                source_address: devnet8_builder_source_address(),
+                pubkey: devnet8_builder_pubkey(),
+            }],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            requests.to_requests().requests_hash(),
+            b256!("f9799dae8c2b40782f525d1d7bd54da6a31515e6f056945153513f660b8009ca")
+        );
+    }
+
+    /// A block carrying Electra and gloas request types together: the `0x03`/`0x04` builder
+    /// requests must be committed alongside the Electra ones, in ascending type order, without
+    /// disturbing them.
+    #[test]
+    fn test_mixed_electra_and_builder_requests_hash() {
+        let withdrawals = vec![WithdrawalRequest {
+            source_address: devnet8_builder_source_address(),
+            validator_pubkey: devnet8_builder_pubkey(),
+            amount: 0,
+        }];
+        let builder_exits = vec![
+            BuilderExitRequest {
+                source_address: devnet8_builder_source_address(),
+                pubkey: devnet8_builder_pubkey(),
+            },
+            BuilderExitRequest {
+                source_address: devnet8_builder_source_address(),
+                pubkey: FixedBytes::repeat_byte(0xb0),
+            },
+        ];
+
+        let requests = ExecutionRequestsV5 {
+            withdrawals: withdrawals.clone(),
+            builder_deposits: devnet8_builder_deposits(),
+            builder_exits: builder_exits.clone(),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            requests.to_requests().requests_hash(),
+            b256!("0ea2b4ddd21d4cbca90bb0391e65120cab2d5b5fd093e84357362bdab9df2fe5")
+        );
+
+        // Request order inside a list is committed to, so a reordered exit list must not
+        // reproduce the same commitment.
+        let reordered = ExecutionRequestsV5 {
+            withdrawals,
+            builder_deposits: devnet8_builder_deposits(),
+            builder_exits: builder_exits.into_iter().rev().collect(),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            reordered.to_requests().requests_hash(),
+            b256!("7a80e960aba502bd450ee7381cd5bf42a178b6098beb54ed9a1e95cce5a9d2b2")
+        );
+    }
+
+    /// The opaque EIP-7685 wire form a relay forwards is what the node decodes back into typed
+    /// requests, so a mixed gloas block must survive that round trip unchanged.
+    #[test]
+    fn test_mixed_builder_requests_round_trip_through_wire_form() {
+        let requests = ExecutionRequestsV5 {
+            builder_deposits: devnet8_builder_deposits(),
+            builder_exits: vec![BuilderExitRequest {
+                source_address: devnet8_builder_source_address(),
+                pubkey: devnet8_builder_pubkey(),
+            }],
+            ..Default::default()
+        };
+
+        let decoded = ExecutionRequestsV5::try_from(&requests.to_requests()).unwrap();
+
+        assert_eq!(decoded, requests);
     }
 
     #[test]
