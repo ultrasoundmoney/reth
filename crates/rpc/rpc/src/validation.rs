@@ -952,10 +952,10 @@ mod tests {
         ExecutionData, ExecutionPayload, ExecutionPayloadV1, ExecutionPayloadV2,
         ExecutionPayloadV3, ExecutionPayloadV4,
     };
+    use reth_chainspec::ChainSpecBuilder;
     use reth_consensus::noop::NoopConsensus;
     use reth_engine_primitives::PayloadValidator;
     use reth_ethereum_engine_primitives::EthPayloadTypes;
-    use reth_chainspec::ChainSpecBuilder;
     use reth_ethereum_primitives::{Block, BlockBody, Transaction};
     use reth_evm::{execute::Executor, ConfigureEvm};
     use reth_evm_ethereum::EthEvmConfig;
@@ -1592,7 +1592,8 @@ mod tests {
     ) -> (MockEthProvider, BuilderBlockValidationRequestV6, SealedBlock<Block>, Address) {
         let provider = MockEthProvider::default();
 
-        let parent = SealedHeader::seal_slow(Header { gas_limit: 30_000_000, ..Default::default() });
+        let parent =
+            SealedHeader::seal_slow(Header { gas_limit: 30_000_000, ..Default::default() });
         provider.add_block(
             parent.hash(),
             Block { header: parent.clone_header(), body: Default::default() },
@@ -1740,9 +1741,7 @@ mod tests {
             state: fee_recipient_spent(message.proposer_fee_recipient),
         };
 
-        test_validation_api(provider)
-            .ensure_payment(&block, &output, &message)
-            .unwrap();
+        test_validation_api(provider).ensure_payment(&block, &output, &message).unwrap();
     }
 
     fn v6_validation_api(
@@ -1773,8 +1772,10 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(matches!(err, ValidationApiError::Blacklist(address) if address == sender),
-            "unexpected error: {err}");
+        assert!(
+            matches!(err, ValidationApiError::Blacklist(address) if address == sender),
+            "unexpected error: {err}"
+        );
     }
 
     /// The counterpart: the same submission, the same disallow list, filtering off. The sender
