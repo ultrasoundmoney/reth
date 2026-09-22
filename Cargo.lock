@@ -266,15 +266,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "alloy-eip8141"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "36422c14bd57dcd638e276c8c9d7ac09eb16598e3a9dbd34e4b55267d4565b5e"
+dependencies = [
+ "alloy-primitives",
+ "alloy-rlp",
+ "arbitrary",
+ "borsh",
+ "serde",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "alloy-eips"
 version = "2.4.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ca3e76d47e8de277cb55e7e77fa38adde835162fc01cddbe1b258b5e0a86035b"
+source = "git+https://github.com/ultrasoundmoney/alloy?rev=0ca1a68c#0ca1a68c551c5309269b660c5306a01ea2391ac1"
 dependencies = [
  "alloy-eip2124",
  "alloy-eip2930",
  "alloy-eip7702",
  "alloy-eip7928",
+ "alloy-eip8141",
  "alloy-primitives",
  "alloy-rlp",
  "alloy-serde",
@@ -643,8 +657,7 @@ dependencies = [
 [[package]]
 name = "alloy-rpc-types-beacon"
 version = "2.4.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c20f226662436bbdc221c9156a1f445c257da5e695b39a26878aa8b2644f710e"
+source = "git+https://github.com/ultrasoundmoney/alloy?rev=0ca1a68c#0ca1a68c551c5309269b660c5306a01ea2391ac1"
 dependencies = [
  "alloy-eips",
  "alloy-primitives",
