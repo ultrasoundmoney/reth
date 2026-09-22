@@ -530,8 +530,8 @@ RPC:
       --rpc.forwarder <FORWARDER>
           Endpoint to forward transactions to
 
-      --builder.disallow <PATH>
-          Path to file containing disallowed addresses, json-encoded list of strings. Block validation API will reject blocks containing transactions from these addresses
+      --builder.disallow-url <URL>
+          URL to fetch the disallowed-address list from (json array of address strings). The block validation API refreshes from it periodically; if unset, the disallow list is empty
 
 RPC State Cache:
       --rpc-cache.max-blocks <MAX_BLOCKS>
