@@ -812,9 +812,15 @@ mod tests {
         eip7002::WithdrawalRequest,
         eip8282::{BuilderDepositRequest, BuilderExitRequest},
     };
-    use alloy_primitives::{address, b256, hex, Address, FixedBytes, B256, U256};
-    use alloy_rpc_types_beacon::{relay::BidTrace, requests::ExecutionRequestsV5};
-    use alloy_rpc_types_engine::{ExecutionData, ExecutionPayload, ExecutionPayloadV1};
+    use alloy_primitives::{address, b256, hex, Address, Bytes, FixedBytes, B256, U256};
+    use alloy_rpc_types_beacon::{
+        relay::{BidTrace, BuilderBlockValidationRequestV6, SignedBidSubmissionV6},
+        requests::ExecutionRequestsV5,
+    };
+    use alloy_rpc_types_engine::{
+        ExecutionData, ExecutionPayload, ExecutionPayloadV1, ExecutionPayloadV2,
+        ExecutionPayloadV3, ExecutionPayloadV4,
+    };
     use reth_consensus::noop::NoopConsensus;
     use reth_engine_primitives::PayloadValidator;
     use reth_ethereum_engine_primitives::EthPayloadTypes;
@@ -913,6 +919,33 @@ mod tests {
         };
         assert_eq!(mismatch.got, message.gas_used);
         assert_eq!(mismatch.expected, payload.as_v1().gas_used);
+    }
+
+    fn test_v6_request() -> BuilderBlockValidationRequestV6 {
+        let ExecutionPayload::V1(payload_v1) = test_execution_payload() else { unreachable!() };
+
+        BuilderBlockValidationRequestV6 {
+            request: SignedBidSubmissionV6 {
+                message: BidTrace::default(),
+                execution_payload: ExecutionPayloadV4 {
+                    payload_inner: ExecutionPayloadV3 {
+                        payload_inner: ExecutionPayloadV2 {
+                            payload_inner: payload_v1,
+                            withdrawals: Vec::new(),
+                        },
+                        blob_gas_used: 0,
+                        excess_blob_gas: 0,
+                    },
+                    block_access_list: Bytes::from_static(&[0xaa, 0xbb]),
+                    slot_number: 6,
+                },
+                blobs_bundle: Default::default(),
+                execution_requests: ExecutionRequestsV5::default(),
+                signature: Default::default(),
+            },
+            registered_gas_limit: 30_000_000,
+            parent_beacon_block_root: B256::ZERO,
+        }
     }
 
     /// EIP-8282 builder deposit requests observed on glamsterdam devnet-8 (relay registry
@@ -1068,6 +1101,39 @@ mod tests {
             reordered.to_requests().requests_hash(),
             b256!("7a80e960aba502bd450ee7381cd5bf42a178b6098beb54ed9a1e95cce5a9d2b2")
         );
+    }
+
+    /// The `execution_requests` object on the RPC body is the surface a relay actually posts, so
+    /// the builder lists must survive JSON as well as SSZ -- and an Electra-shaped body (no
+    /// builder keys at all) must still parse, which is what keeps V6 callers working.
+    #[test]
+    fn test_v6_body_carries_builder_requests_over_json() {
+        let mut request = test_v6_request();
+        request.request.execution_requests = ExecutionRequestsV5 {
+            builder_deposits: devnet8_builder_deposits(),
+            builder_exits: vec![BuilderExitRequest {
+                source_address: devnet8_builder_source_address(),
+                pubkey: devnet8_builder_pubkey(),
+            }],
+            ..Default::default()
+        };
+
+        let json = serde_json::to_value(&request).unwrap();
+
+        assert_eq!(json["execution_requests"]["builder_deposits"].as_array().unwrap().len(), 2);
+        assert_eq!(json["execution_requests"]["builder_exits"].as_array().unwrap().len(), 1);
+
+        let parsed: BuilderBlockValidationRequestV6 = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(parsed, request);
+
+        let mut electra_shaped = json;
+        electra_shaped["execution_requests"] =
+            serde_json::json!({ "deposits": [], "withdrawals": [], "consolidations": [] });
+
+        let parsed: BuilderBlockValidationRequestV6 =
+            serde_json::from_value(electra_shaped).unwrap();
+        assert!(parsed.request.execution_requests.builder_deposits.is_empty());
+        assert!(parsed.request.execution_requests.builder_exits.is_empty());
     }
 
     /// The opaque EIP-7685 wire form a relay forwards is what the node decodes back into typed
