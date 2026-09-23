@@ -663,12 +663,10 @@ vergen-git2 = "10.0.1"
 ipnet = "2.11"
 
 [patch.crates-io]
-# alloy fork carrying the EIP-8282 builder request types and ExecutionRequestsV5;
-# drop once upstreamed to alloy-rs/alloy.
-#
-# `-patchable` is `christian/eip8282-builder-execution-requests` plus the fork's
-# patch-plumbing commit: without it alloy's workspace `path` deps drag the whole
+# The EIP-8282 builder request types and ExecutionRequestsV5 are upstream in alloy
+# as of alloy-rs/alloy#4215, so this is alloy main plus one commit: the fork's
+# patch-plumbing. Without that commit alloy's workspace `path` deps drag the whole
 # alloy tree in beside the registry copies and the build fails on duplicate
-# alloy-serde / alloy-consensus.
-alloy-rpc-types-beacon = { git = "https://github.com/ultrasoundmoney/alloy", rev = "0ca1a68c" }
-alloy-eips = { git = "https://github.com/ultrasoundmoney/alloy", rev = "0ca1a68c" }
+# alloy-serde / alloy-consensus. Drop the patch once a release carries #4215.
+alloy-rpc-types-beacon = { git = "https://github.com/ultrasoundmoney/alloy", rev = "89678d7b" }
+alloy-eips = { git = "https://github.com/ultrasoundmoney/alloy", rev = "89678d7b" }
