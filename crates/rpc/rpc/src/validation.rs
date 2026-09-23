@@ -1302,17 +1302,27 @@ mod tests {
         input
     }
 
-    /// Reproduces the mainnet failure at slot 14968908 end to end: a correct forwarder payment,
-    /// actually executed, where the fee recipient's own spending makes the balance-delta
-    /// shortcut miss. `ensure_payment` must accept it on the last-transaction path.
+    /// The runtime deployed at `DEFAULT_PAYMENT_FORWARDERS[0]`, whose hash the entry pins.
+    const PAYMENT_FORWARDER_RUNTIME: [u8; 20] = hex!("5f358060e01c4218600f5760401cff5b5f5ffd00");
+
+    /// The contract reverts unless the calldata repeats the block timestamp, so the fixture and
+    /// its calldata have to agree on one.
+    const FORWARDER_BLOCK_TIMESTAMP: u64 = 1_786_450_919;
+
+    /// Drives `ensure_payment` over a one-transaction block that pays `call_to` the bid value,
+    /// with `runtime` deployed at `deployed_at` and the calldata built from the block's proposer
+    /// fee recipient.
     ///
     /// The sender is also the fee recipient, so its gas spend puts the balance delta below the
-    /// bid and validation falls through to the forwarder check.
-    #[test]
-    fn ensure_payment_accepts_an_executed_forwarder_payment() {
-        let (forwarder, _) = DEFAULT_PAYMENT_FORWARDERS[0];
-        let runtime = hex!("5f358060e01c4218600f5760401cff5b5f5ffd00");
-        let timestamp: u64 = 1_786_450_919;
+    /// bid and validation falls through to the last-transaction path the forwarder rules live
+    /// on. Returns whether the payment transaction itself succeeded alongside the outcome, so a
+    /// rejection can be attributed to those rules rather than to a revert.
+    fn ensure_payment_over_a_forwarder_call(
+        deployed_at: Address,
+        runtime: &[u8],
+        call_to: Address,
+        calldata: impl FnOnce(Address) -> Vec<u8>,
+    ) -> (bool, Result<(), ValidationApiError>) {
         let value = U256::from(8_594_702_506_957_281u64);
         let base_fee: u64 = 7;
 
@@ -1328,7 +1338,7 @@ mod tests {
             ExtendedAccount::new(0, U256::from(10).pow(U256::from(18))),
         );
         provider.add_account(
-            forwarder,
+            deployed_at,
             ExtendedAccount::new(1, U256::ZERO).with_bytecode(runtime.to_vec().into()),
         );
 
@@ -1340,15 +1350,15 @@ mod tests {
                 gas_limit: 100_000,
                 max_fee_per_gas: base_fee as u128,
                 max_priority_fee_per_gas: 0,
-                to: TxKind::Call(forwarder),
+                to: TxKind::Call(call_to),
                 value,
-                input: forwarder_calldata(fee_recipient, timestamp as u32).into(),
+                input: calldata(fee_recipient).into(),
                 ..Default::default()
             }),
         );
 
         let header = Header {
-            timestamp,
+            timestamp: FORWARDER_BLOCK_TIMESTAMP,
             base_fee_per_gas: Some(base_fee),
             gas_limit: 30_000_000,
             parent_beacon_block_root: Some(B256::ZERO),
@@ -1366,7 +1376,7 @@ mod tests {
             .batch_executor(StateProviderDatabase::new(provider.latest().unwrap()))
             .execute(&block)
             .unwrap();
-        assert!(output.receipts.last().unwrap().success, "the payment executed");
+        let executed = output.receipts.last().unwrap().success;
 
         let message =
             BidTrace { proposer_fee_recipient: fee_recipient, value, ..Default::default() };
@@ -1380,10 +1390,116 @@ mod tests {
             Arc::new(UnusedPayloadValidator),
         );
 
-        assert!(
-            api.ensure_payment(&block, &output, &message).is_ok(),
-            "a correct forwarder payment must validate"
+        (executed, api.ensure_payment(&block, &output, &message))
+    }
+
+    /// Reproduces the mainnet failure at slot 14968908 end to end: a correct forwarder payment,
+    /// actually executed, where the fee recipient's own spending makes the balance-delta
+    /// shortcut miss. `ensure_payment` must accept it on the last-transaction path.
+    #[test]
+    fn ensure_payment_accepts_an_executed_forwarder_payment() {
+        let (forwarder, _) = DEFAULT_PAYMENT_FORWARDERS[0];
+
+        let (executed, outcome) = ensure_payment_over_a_forwarder_call(
+            forwarder,
+            &PAYMENT_FORWARDER_RUNTIME,
+            forwarder,
+            |fee_recipient| forwarder_calldata(fee_recipient, FORWARDER_BLOCK_TIMESTAMP as u32),
         );
+
+        assert!(executed, "the payment executed");
+        assert!(outcome.is_ok(), "a correct forwarder payment must validate: {outcome:?}");
+    }
+
+    /// The listed address is half the entry: the very same contract, byte for byte, deployed
+    /// somewhere unlisted must not be trusted to have forwarded anything. Without this an
+    /// attacker only has to redeploy the runtime to mint accepted payments.
+    #[test]
+    fn ensure_payment_rejects_a_forwarder_payment_to_an_unlisted_address() {
+        let unlisted = Address::repeat_byte(0x42);
+        assert!(!PAYMENT_FORWARDERS.contains_key(&unlisted));
+
+        let (executed, outcome) = ensure_payment_over_a_forwarder_call(
+            unlisted,
+            &PAYMENT_FORWARDER_RUNTIME,
+            unlisted,
+            |fee_recipient| forwarder_calldata(fee_recipient, FORWARDER_BLOCK_TIMESTAMP as u32),
+        );
+
+        assert!(executed, "the forwarder ran, it is only unlisted");
+        assert!(
+            matches!(outcome, Err(ValidationApiError::ProposerPayment)),
+            "unexpected outcome: {outcome:?}"
+        );
+    }
+
+    /// The code hash is the other half: a listed address carrying anything but its own runtime
+    /// must be rejected. A value call to a contract that forwards nothing still succeeds and
+    /// keeps the value, so the address alone would validate a payment the proposer never got.
+    #[test]
+    fn ensure_payment_rejects_a_listed_forwarder_carrying_other_code() {
+        let (forwarder, code_hash) = DEFAULT_PAYMENT_FORWARDERS[0];
+        let other_runtime = hex!("00");
+        assert_ne!(keccak256(other_runtime), code_hash);
+
+        let (executed, outcome) = ensure_payment_over_a_forwarder_call(
+            forwarder,
+            &other_runtime,
+            forwarder,
+            |fee_recipient| forwarder_calldata(fee_recipient, FORWARDER_BLOCK_TIMESTAMP as u32),
+        );
+
+        assert!(executed, "the call succeeds, the value simply stays put");
+        assert!(
+            matches!(outcome, Err(ValidationApiError::ProposerPayment)),
+            "unexpected outcome: {outcome:?}"
+        );
+    }
+
+    /// The forwarder pays whoever the calldata names, which need not be the proposer.
+    #[test]
+    fn ensure_payment_rejects_a_forwarder_payment_naming_another_recipient() {
+        let (forwarder, _) = DEFAULT_PAYMENT_FORWARDERS[0];
+        let someone_else = Address::repeat_byte(0x99);
+
+        let (executed, outcome) = ensure_payment_over_a_forwarder_call(
+            forwarder,
+            &PAYMENT_FORWARDER_RUNTIME,
+            forwarder,
+            |_| forwarder_calldata(someone_else, FORWARDER_BLOCK_TIMESTAMP as u32),
+        );
+
+        assert!(executed, "the forwarder paid, just not the proposer");
+        assert!(
+            matches!(outcome, Err(ValidationApiError::ProposerPayment)),
+            "unexpected outcome: {outcome:?}"
+        );
+    }
+
+    /// Short calldata zero-pads the recipient, so the contract forwards the value to an address
+    /// nobody chose. Every truncation has to be rejected, whether the call reverts or succeeds.
+    #[test]
+    fn ensure_payment_rejects_a_forwarder_payment_with_short_calldata() {
+        let (forwarder, _) = DEFAULT_PAYMENT_FORWARDERS[0];
+
+        for len in 0..PAYMENT_FORWARDER_CALLDATA_LEN {
+            let (_, outcome) = ensure_payment_over_a_forwarder_call(
+                forwarder,
+                &PAYMENT_FORWARDER_RUNTIME,
+                forwarder,
+                |fee_recipient| {
+                    let mut input =
+                        forwarder_calldata(fee_recipient, FORWARDER_BLOCK_TIMESTAMP as u32);
+                    input.truncate(len);
+                    input
+                },
+            );
+
+            assert!(
+                matches!(outcome, Err(ValidationApiError::ProposerPayment)),
+                "accepted {len} bytes: {outcome:?}"
+            );
+        }
     }
 
     #[test]
@@ -1396,10 +1512,9 @@ mod tests {
     /// If this stops matching, the contract changed and its address changed with it.
     #[test]
     fn payment_forwarder_code_hash_matches_the_deployed_runtime() {
-        let runtime = alloy_primitives::hex!("5f358060e01c4218600f5760401cff5b5f5ffd00");
         let (_, code_hash) = DEFAULT_PAYMENT_FORWARDERS[0];
 
-        assert_eq!(keccak256(runtime), code_hash);
+        assert_eq!(keccak256(PAYMENT_FORWARDER_RUNTIME), code_hash);
     }
 
     /// The migration case: both deployments accepted at once, each pinned to its own code hash.
