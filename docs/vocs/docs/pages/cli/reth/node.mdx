@@ -533,6 +533,9 @@ RPC:
       --builder.disallow-url <URL>
           URL to fetch the disallowed-address list from (json array of address strings). The block validation API refreshes from it periodically; if unset, the disallow list is empty
 
+      --ssz-block-validation.port <PORT>
+          Port for the SSZ transport of the block validation API, bound on `--http.addr`: it takes `flashbots_validateBuilderSubmissionV5` requests SSZ-encoded instead of as JSON. Disabled if unset
+
 RPC State Cache:
       --rpc-cache.max-blocks <MAX_BLOCKS>
           Max number of blocks in cache

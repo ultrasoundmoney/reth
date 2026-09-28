@@ -3,12 +3,13 @@
 use crate::{
     engine_ssz_proxy::{EngineSszApi, EngineSszProxyLayer},
     engine_ssz_witness::EngineSszWitnessGenerator,
-    EthEngineTypes, EthEvmConfig,
+    validation_ssz, EthEngineTypes, EthEvmConfig,
 };
 use alloy_eips::{eip7840::BlobParams, merge::EPOCH_SLOTS};
 use alloy_network::Ethereum;
 use alloy_primitives::map::AddressSet;
 use alloy_rpc_types_engine::ExecutionData;
+use eyre::WrapErr;
 use reth_chainspec::{ChainSpec, EthChainSpec, EthereumHardforks, Hardforks};
 use reth_engine_local::LocalPayloadAttributesBuilder;
 use reth_engine_primitives::EngineTypes;
@@ -66,9 +67,11 @@ use reth_transaction_pool::{
 use revm::context::TxEnv;
 use std::{
     marker::PhantomData,
+    net::SocketAddr,
     sync::Arc,
     time::{Duration, SystemTime},
 };
+use tokio::net::TcpListener;
 
 /// How often a running node re-fetches the builder disallow list from its url.
 const DISALLOW_REFRESH_INTERVAL: Duration = Duration::from_secs(300);
@@ -402,6 +405,23 @@ where
                     }
                 }
             });
+        }
+
+        if let Some(port) = ctx.config.rpc.ssz_block_validation_port {
+            let addr = SocketAddr::new(ctx.config.rpc.http_addr, port);
+            let listener = TcpListener::bind(addr).await.wrap_err_with(|| {
+                format!("failed to bind the ssz block validation server to {addr}")
+            })?;
+            info!(target: "reth::cli", %addr, "ssz block validation server started");
+
+            ctx.node.task_executor().spawn_critical_task(
+                "ssz block validation server",
+                validation_ssz::serve(
+                    listener,
+                    validation_api.clone(),
+                    ctx.config.rpc.rpc_max_request_size_bytes() as usize,
+                ),
+            );
         }
 
         let eth_config =
