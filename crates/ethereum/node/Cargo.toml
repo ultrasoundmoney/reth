@@ -50,9 +50,10 @@ jsonrpsee.workspace = true
 alloy-network.workspace = true
 alloy-rpc-types-eth.workspace = true
 alloy-rpc-types-engine = { workspace = true, features = ["ssz"] }
+alloy-rpc-types-beacon = { workspace = true, features = ["ssz"] }
 
 # async
-tokio = { workspace = true, features = ["sync"] }
+tokio = { workspace = true, features = ["sync", "net", "time"] }
 
 # revm with required ethereum features
 # Note: this must be kept to ensure all features are properly enabled/forwarded
@@ -60,10 +61,13 @@ revm = { workspace = true, features = ["secp256k1", "blst", "c-kzg", "memory_lim
 
 # misc
 eyre.workspace = true
+bytes.workspace = true
 ethereum_ssz.workspace = true
 ethereum_ssz_derive.workspace = true
 futures.workspace = true
 http-body-util.workspace = true
+hyper = { workspace = true, features = ["server", "http1"] }
+hyper-util = { workspace = true, features = ["tokio"] }
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -85,7 +89,6 @@ alloy-genesis.workspace = true
 alloy-signer.workspace = true
 alloy-sol-types.workspace = true
 alloy-contract.workspace = true
-alloy-rpc-types-beacon = { workspace = true, features = ["ssz"] }
 
 tokio.workspace = true
 serde_json.workspace = true
