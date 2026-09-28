@@ -96,6 +96,7 @@ pub struct DefaultRpcServerArgs {
     rpc_pending_block: PendingBlockKind,
     rpc_forwarder: Option<Url>,
     builder_disallow_url: Option<String>,
+    ssz_block_validation_port: Option<u16>,
     pub(super) rpc_state_cache: RpcStateCacheArgs,
     pub(super) gas_price_oracle: GasPriceOracleArgs,
     rpc_send_raw_transaction_sync_timeout: Duration,
@@ -370,6 +371,12 @@ impl DefaultRpcServerArgs {
         self
     }
 
+    /// Set the default SSZ block validation server port
+    pub const fn with_ssz_block_validation_port(mut self, v: Option<u16>) -> Self {
+        self.ssz_block_validation_port = v;
+        self
+    }
+
     /// Set the default RPC state cache args
     pub const fn with_rpc_state_cache(mut self, v: RpcStateCacheArgs) -> Self {
         self.rpc_state_cache = v;
@@ -435,6 +442,7 @@ impl Default for DefaultRpcServerArgs {
             rpc_pending_block: PendingBlockKind::Full,
             rpc_forwarder: None,
             builder_disallow_url: None,
+            ssz_block_validation_port: None,
             rpc_state_cache: RpcStateCacheArgs::default(),
             gas_price_oracle: GasPriceOracleArgs::default(),
             rpc_send_raw_transaction_sync_timeout:
@@ -746,6 +754,12 @@ pub struct RpcServerArgs {
     #[arg(long = "builder.disallow-url", value_name = "URL", default_value = Resettable::from(DefaultRpcServerArgs::get_global().builder_disallow_url.as_ref().map(|v| v.clone().into())))]
     pub builder_disallow_url: Option<String>,
 
+    /// Port for the SSZ transport of the block validation API, bound on `--http.addr`: it takes
+    /// `flashbots_validateBuilderSubmissionV5` requests SSZ-encoded instead of as JSON. Disabled
+    /// if unset.
+    #[arg(long = "ssz-block-validation.port", value_name = "PORT", default_value = Resettable::from(DefaultRpcServerArgs::get_global().ssz_block_validation_port.map(|v| v.to_string().into())))]
+    pub ssz_block_validation_port: Option<u16>,
+
     /// State cache configuration.
     #[command(flatten)]
     pub rpc_state_cache: RpcStateCacheArgs,
@@ -972,6 +986,7 @@ impl Default for RpcServerArgs {
             rpc_pending_block,
             rpc_forwarder,
             builder_disallow_url,
+            ssz_block_validation_port,
             rpc_state_cache,
             gas_price_oracle,
             rpc_send_raw_transaction_sync_timeout,
@@ -1021,6 +1036,7 @@ impl Default for RpcServerArgs {
             rpc_pending_block,
             rpc_forwarder,
             builder_disallow_url,
+            ssz_block_validation_port,
             rpc_state_cache,
             gas_price_oracle,
             rpc_send_raw_transaction_sync_timeout,
@@ -1334,6 +1350,7 @@ mod tests {
             rpc_pending_block: PendingBlockKind::Full,
             rpc_forwarder: Some("http://localhost:8545".parse().unwrap()),
             builder_disallow_url: None,
+            ssz_block_validation_port: None,
             rpc_state_cache: RpcStateCacheArgs {
                 max_blocks: 5000,
                 max_receipts: 2000,
