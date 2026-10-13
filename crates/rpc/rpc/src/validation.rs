@@ -814,6 +814,14 @@ where
         let PreparedV6 { block, decoded_bal, message, registered_gas_limit, transaction_filter } =
             self.prepare_v6(request)?;
 
+        // Executing on a non-canonical in-memory parent (a sibling of the tip) hangs and leaks
+        // in the overlay state path, so only blocks built on the tip are served.
+        let latest_header =
+            self.provider.latest_header()?.ok_or_else(|| ValidationApiError::MissingLatestBlock)?;
+        if block.parent_hash() != latest_header.hash() {
+            return Err(ValidationApiError::ParentNotTip)
+        }
+
         let validated = self
             .validate_block(
                 &block,
@@ -1224,6 +1232,10 @@ pub enum ValidationApiError {
     MissingParentBlock,
     #[error("block is too old, outside validation window")]
     BlockTooOld,
+    #[error(
+        "parent is not the current tip; adjustment data is only served for blocks built on head"
+    )]
+    ParentNotTip,
     #[error("could not verify proposer payment")]
     ProposerPayment,
     #[error("invalid blobs bundle")]
@@ -1253,6 +1265,7 @@ impl From<ValidationApiError> for ErrorObject<'static> {
             ValidationApiError::GasUsedMismatch(_) |
             ValidationApiError::ParentHashMismatch(_) |
             ValidationApiError::BlockHashMismatch(_) |
+            ValidationApiError::ParentNotTip |
             ValidationApiError::Blacklist(_) |
             ValidationApiError::ProposerPayment |
             ValidationApiError::InvalidBlobsBundle |
@@ -1296,9 +1309,9 @@ mod tests {
     use super::{
         build_adjustment_data, distribution_value_to, hash_disallow_list, index_key,
         parse_payment_forwarders, payment_forwarder_recipient, validate_message_against_payload,
-        AddressSet, BuilderBlockValidationRequestV6, TransactionFilter, ValidationApi,
-        ValidationApiConfig, ValidationApiError, DEFAULT_PAYMENT_FORWARDERS, PAYMENT_FORWARDERS,
-        PAYMENT_FORWARDER_CALLDATA_LEN, SAFE_EXECUTION_SUCCESS_TOPIC,
+        AddressSet, AdjustmentDataRequest, BuilderBlockValidationRequestV6, TransactionFilter,
+        ValidationApi, ValidationApiConfig, ValidationApiError, DEFAULT_PAYMENT_FORWARDERS,
+        PAYMENT_FORWARDERS, PAYMENT_FORWARDER_CALLDATA_LEN, SAFE_EXECUTION_SUCCESS_TOPIC,
     };
     use alloy_consensus::{
         constants::KECCAK_EMPTY,
@@ -2328,6 +2341,34 @@ mod tests {
             !matches!(result, Err(ValidationApiError::Blacklist(_))),
             "the disallow list was consulted without the filter: {result:?}"
         );
+    }
+
+    /// Adjustment data is refused before execution for a submission whose parent is no longer
+    /// the tip: a sibling imported at the same height makes the latest header differ.
+    #[tokio::test]
+    async fn adjustment_data_refuses_a_parent_that_is_not_the_tip() {
+        let (provider, request, block, _) = v6_submission_with_one_sender();
+        let sibling = SealedHeader::seal_slow(Header {
+            parent_hash: block.parent_hash(),
+            number: block.number(),
+            gas_limit: block.gas_limit(),
+            timestamp: block.timestamp() + 1,
+            ..Default::default()
+        });
+        provider.add_block(
+            sibling.hash(),
+            Block { header: sibling.clone_header(), body: Default::default() },
+        );
+
+        let err = v6_validation_api(provider, block, AddressSet::default())
+            .adjustment_data(AdjustmentDataRequest {
+                request,
+                fee_payer: Address::repeat_byte(0x22),
+            })
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, ValidationApiError::ParentNotTip), "unexpected error: {err}");
     }
 
     /// Execution state for a block in which `address` ended up poorer than it started.
