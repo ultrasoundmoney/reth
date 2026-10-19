@@ -33,7 +33,7 @@ use reth_metrics::{
 use reth_node_api::{NewPayloadError, PayloadTypes};
 use reth_primitives_traits::{
     block::error::SealedBlockRecoveryError, Block, BlockBody, GotExpected, NodePrimitives,
-    RecoveredBlock, SealedBlock, SealedHeaderFor,
+    RecoveredBlock, SealedHeaderFor,
 };
 use reth_revm::{cached::CachedReads, database::StateProviderDatabase};
 use reth_rpc_api::{
@@ -44,8 +44,7 @@ use reth_rpc_api::{
 use reth_rpc_server_types::result::{internal_rpc_err, invalid_params_rpc_err};
 use reth_storage_api::{
     AccountReader, BlockReaderIdExt, HashedPostStateProvider, StateProofProvider, StateProvider,
-    StateProviderBox,
-    StateProviderFactory,
+    StateProviderBox, StateProviderFactory,
 };
 use reth_tasks::Runtime;
 use reth_trie_common::{proof::ProofRetainer, HashBuilder, MultiProofTargets, Nibbles, TrieInput};
@@ -2535,7 +2534,9 @@ mod tests {
         let senders = vec![builder, builder];
 
         let output = EthEvmConfig::new(chain_spec)
-            .batch_executor(StateProviderDatabase::new(&state))
+            .batch_executor(StateProviderDatabase::new(reth_storage_api::EvmStateProviderAdapter(
+                &state,
+            )))
             .execute(&RecoveredBlock::new_unhashed(
                 Block { header: header.clone(), body: body.clone() },
                 senders.clone(),
