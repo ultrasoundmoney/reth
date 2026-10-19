@@ -31,7 +31,7 @@ use reth_metrics::{
 use reth_node_api::{NewPayloadError, PayloadTypes};
 use reth_primitives_traits::{
     block::error::SealedBlockRecoveryError, BlockBody, GotExpected, NodePrimitives, RecoveredBlock,
-    SealedBlock, SealedHeaderFor,
+    SealedHeaderFor,
 };
 use reth_revm::{cached::CachedReads, database::StateProviderDatabase};
 use reth_rpc_api::{
@@ -41,8 +41,7 @@ use reth_rpc_api::{
 };
 use reth_rpc_server_types::result::{internal_rpc_err, invalid_params_rpc_err};
 use reth_storage_api::{
-    AccountReader, BlockReaderIdExt, HashedPostStateProvider, StateProvider,
-    StateProviderFactory,
+    AccountReader, BlockReaderIdExt, HashedPostStateProvider, StateProvider, StateProviderFactory,
 };
 use reth_tasks::Runtime;
 use serde::{Deserialize, Serialize};
@@ -1580,7 +1579,9 @@ mod tests {
 
         let evm_config = EthEvmConfig::new(chain_spec);
         let output = evm_config
-            .batch_executor(StateProviderDatabase::new(provider.latest().unwrap()))
+            .batch_executor(StateProviderDatabase::new(reth_storage_api::EvmStateProviderAdapter(
+                provider.latest().unwrap(),
+            )))
             .execute(&block)
             .unwrap();
         let executed = output.receipts.last().unwrap().success;
@@ -1595,6 +1596,7 @@ mod tests {
             ValidationApiConfig::default(),
             Runtime::test(),
             Arc::new(UnusedPayloadValidator),
+            None,
         );
 
         (executed, api.ensure_payment(&block, &output, &message))
@@ -2119,6 +2121,7 @@ mod tests {
             ValidationApiConfig { disallow, ..Default::default() },
             Runtime::test(),
             Arc::new(FixedBlockPayloadValidator(block)),
+            None,
         )
     }
 
