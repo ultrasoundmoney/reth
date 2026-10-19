@@ -6,9 +6,9 @@ use alloy_provider::{
     ext::DebugApi, network::TransactionBuilder, Provider, ProviderBuilder, SendableTx,
 };
 use alloy_rpc_types_beacon::relay::{
-    BidTrace, BuilderBlockValidationRequestV3, BuilderBlockValidationRequestV4,
-    BuilderBlockValidationRequestV5, BuilderBlockValidationRequestV6, SignedBidSubmissionV3,
-    SignedBidSubmissionV4, SignedBidSubmissionV5, SignedBidSubmissionV6,
+    BidTrace, BuilderBlockValidationRequestV4, BuilderBlockValidationRequestV5,
+    BuilderBlockValidationRequestV6, SignedBidSubmissionV3, SignedBidSubmissionV4,
+    SignedBidSubmissionV5, SignedBidSubmissionV6,
 };
 use alloy_rpc_types_engine::{
     BlobsBundleV1, CancunPayloadFields, ExecutionPayload, ExecutionPayloadSidecar,
@@ -432,7 +432,7 @@ async fn test_flashbots_validate_v3() -> eyre::Result<()> {
     let _ = provider.send_transaction(TransactionRequest::default().to(Address::ZERO)).await?;
     let payload = node.new_payload().await?;
 
-    let mut request = BuilderBlockValidationRequestV3 {
+    let mut request = reth_rpc_api::servers::BuilderBlockValidationRequestV3 {
         request: SignedBidSubmissionV3 {
             message: BidTrace {
                 parent_hash: payload.block().parent_hash,
@@ -450,6 +450,7 @@ async fn test_flashbots_validate_v3() -> eyre::Result<()> {
         },
         parent_beacon_block_root: payload.block().parent_beacon_block_root.unwrap(),
         registered_gas_limit: payload.block().gas_limit,
+        transaction_filter: Default::default(),
     };
 
     assert!(provider
