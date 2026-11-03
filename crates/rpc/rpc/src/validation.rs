@@ -3,8 +3,10 @@ use alloy_consensus::{
     BlobTransactionValidationError, BlockHeader, EnvKzgSettings, Transaction, TxReceipt,
 };
 use alloy_eip7928::{bal::DecodedBal, compute_block_access_list_hash};
-use alloy_eips::eip7685::RequestsOrHash;
-use alloy_primitives::{address, b256, map::AddressSet, Address, B256, U256};
+use alloy_eips::{eip2718::Encodable2718, eip7685::RequestsOrHash};
+use alloy_primitives::{
+    address, b256, keccak256, map::AddressSet, Address, Bloom, Bytes, B256, U256,
+};
 use alloy_rpc_types_beacon::relay::{
     BidTrace, BuilderBlockValidationRequest, BuilderBlockValidationRequestV2,
 };
@@ -38,19 +40,21 @@ use reth_metrics::{
 };
 use reth_payload_primitives::{NewPayloadError, PayloadTypes};
 use reth_primitives_traits::{
-    block::error::SealedBlockRecoveryError, BlockBody, GotExpected, NodePrimitives, RecoveredBlock,
-    SealedHeaderFor,
+    block::error::SealedBlockRecoveryError, Block, BlockBody, GotExpected, NodePrimitives,
+    RecoveredBlock, SealedHeaderFor,
 };
 use reth_rpc_api::{
-    BlockSubmissionValidationApiServer, BuilderBlockValidationRequestV3,
-    BuilderBlockValidationRequestV4, BuilderBlockValidationRequestV5,
-    BuilderBlockValidationRequestV6, TransactionFilter,
+    AdjustmentData, AdjustmentDataRequest, BlockSubmissionValidationApiServer,
+    BuilderBlockValidationRequestV3, BuilderBlockValidationRequestV4,
+    BuilderBlockValidationRequestV5, BuilderBlockValidationRequestV6, TransactionFilter,
 };
 use reth_rpc_server_types::result::{internal_rpc_err, invalid_params_rpc_err};
 use reth_storage_api::{
-    AccountReader, BlockReaderIdExt, HashedPostStateProvider, StateProvider, StateProviderFactory,
+    AccountReader, BlockReaderIdExt, HashedPostStateProvider, StateProofProvider, StateProvider,
+    StateProviderBox, StateProviderFactory,
 };
 use reth_tasks::Runtime;
+use reth_trie_common::{proof::ProofRetainer, HashBuilder, MultiProofTargets, Nibbles, TrieInput};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -336,7 +340,23 @@ where
         transaction_filter: TransactionFilter,
         decoded_bal: Option<DecodedBal>,
     ) -> Result<(), ValidationApiError> {
-        self.validate_message_against_header(block.sealed_header(), &message)?;
+        self.validate_block(&block, &message, registered_gas_limit, transaction_filter, decoded_bal)
+            .await
+            .map(drop)
+    }
+
+    /// Validates the block like [`Self::validate_message_against_block`], keeping what execution
+    /// produced for callers that need more than the verdict.
+    async fn validate_block(
+        &self,
+        block: &RecoveredBlock<<E::Primitives as NodePrimitives>::Block>,
+        message: &BidTrace,
+        registered_gas_limit: u64,
+        transaction_filter: TransactionFilter,
+        decoded_bal: Option<DecodedBal>,
+    ) -> Result<ValidatedBlock<<E::Primitives as NodePrimitives>::Receipt>, ValidationApiError>
+    {
+        self.validate_message_against_header(block.sealed_header(), message)?;
 
         self.consensus.validate_header(block.sealed_header())?;
         self.consensus.validate_block_pre_execution(block.sealed_block())?;
@@ -414,7 +434,7 @@ where
                 AccountRecordingDb { db: cached_db, accounts: &mut accessed_accounts };
             let mut executor = self.evm_config.batch_executor(recording_db);
 
-            let result = executor.execute_one(&block)?;
+            let result = executor.execute_one(block)?;
 
             // The executor rebuilds the block access list whenever the block header contains a
             // BAL hash. Comparing the rebuilt hash against the header post execution also
@@ -441,13 +461,13 @@ where
         self.update_cached_reads(parent_header_hash, request_cache).await;
 
         self.consensus.validate_block_post_execution(
-            &block,
+            block,
             &output,
             None,
             block_access_list_hash,
         )?;
 
-        self.ensure_payment(&block, &output, &message)?;
+        self.ensure_payment(block, &output, message)?;
 
         let hashed_state = state_provider.hashed_post_state(&output.state)?;
         let state_root = state_provider.state_root(hashed_state)?;
@@ -459,7 +479,7 @@ where
             .into())
         }
 
-        Ok(())
+        Ok(ValidatedBlock { state_provider, output })
     }
 
     /// Ensures that fields of [`BidTrace`] match the fields of the [`SealedHeaderFor`].
@@ -787,11 +807,11 @@ where
         .await
     }
 
-    /// Core logic for validating the builder submission v6
-    async fn validate_builder_submission_v6(
+    /// Converts a v6 submission into the block to validate, with its decoded access list.
+    fn prepare_v6(
         &self,
         request: BuilderBlockValidationRequestV6,
-    ) -> Result<(), ValidationApiError> {
+    ) -> Result<PreparedV6<<E::Primitives as NodePrimitives>::Block>, ValidationApiError> {
         let payload = ExecutionPayload::V4(request.request.execution_payload);
         validate_message_against_payload(&request.request.message, &payload)?;
 
@@ -826,14 +846,216 @@ where
             }
         }
 
+        Ok(PreparedV6 {
+            block,
+            decoded_bal,
+            message: request.request.message,
+            registered_gas_limit: request.registered_gas_limit,
+            transaction_filter: request.transaction_filter,
+        })
+    }
+
+    /// Core logic for validating the builder submission v6
+    async fn validate_builder_submission_v6(
+        &self,
+        request: BuilderBlockValidationRequestV6,
+    ) -> Result<(), ValidationApiError> {
+        let PreparedV6 { block, decoded_bal, message, registered_gas_limit, transaction_filter } =
+            self.prepare_v6(request)?;
+
         self.validate_message_against_block(
             block,
-            request.request.message,
-            request.registered_gas_limit,
-            request.transaction_filter,
+            message,
+            registered_gas_limit,
+            transaction_filter,
             Some(decoded_bal),
         )
         .await
+    }
+
+    /// Validates the submission and proves the accounts and placeholder the relay rewrites.
+    async fn adjustment_data(
+        &self,
+        request: AdjustmentDataRequest,
+    ) -> Result<AdjustmentData, ValidationApiError> {
+        let AdjustmentDataRequest { request, fee_payer } = request;
+        let PreparedV6 { block, decoded_bal, message, registered_gas_limit, transaction_filter } =
+            self.prepare_v6(request)?;
+
+        // Executing on a non-canonical in-memory parent (a sibling of the tip) hangs and leaks
+        // in the overlay state path, so only blocks built on the tip are served.
+        let latest_header =
+            self.provider.latest_header()?.ok_or_else(|| ValidationApiError::MissingLatestBlock)?;
+        if block.parent_hash() != latest_header.hash() {
+            return Err(ValidationApiError::ParentNotTip)
+        }
+
+        let validated = self
+            .validate_block(
+                &block,
+                &message,
+                registered_gas_limit,
+                transaction_filter,
+                Some(decoded_bal),
+            )
+            .await?;
+
+        build_adjustment_data::<E::Primitives, _>(
+            &*validated.state_provider,
+            &block,
+            &validated.output,
+            message.proposer_fee_recipient,
+            fee_payer,
+        )
+    }
+}
+
+/// What validating a block leaves behind: the parent state it executed on and its execution
+/// output.
+struct ValidatedBlock<R> {
+    state_provider: StateProviderBox,
+    output: BlockExecutionOutput<R>,
+}
+
+/// A v6 submission converted into its block, ready for validation.
+struct PreparedV6<B: Block> {
+    block: RecoveredBlock<B>,
+    decoded_bal: DecodedBal,
+    message: BidTrace,
+    registered_gas_limit: u64,
+    transaction_filter: TransactionFilter,
+}
+
+/// Proves the placeholder payment (the last transaction) and the three accounts its replacement
+/// touches, over the block's post-state and its transaction and receipt tries.
+fn build_adjustment_data<N, P>(
+    state_provider: &P,
+    block: &RecoveredBlock<N::Block>,
+    output: &BlockExecutionOutput<N::Receipt>,
+    fee_recipient: Address,
+    fee_payer: Address,
+) -> Result<AdjustmentData, ValidationApiError>
+where
+    N: NodePrimitives,
+    P: StateProofProvider + HashedPostStateProvider + ?Sized,
+{
+    let transactions = block.body().transactions();
+    let receipts = &output.receipts;
+    let placeholder_index = transactions
+        .len()
+        .checked_sub(1)
+        .ok_or_else(|| ValidationApiError::AdjustmentData("block has no transactions".into()))?;
+    let builder = block.senders()[placeholder_index];
+
+    let hashed_state = state_provider.hashed_post_state(&output.state)?;
+    let multiproof = state_provider.multiproof(
+        TrieInput::from_state(hashed_state),
+        MultiProofTargets::accounts([builder, fee_recipient, fee_payer].map(keccak256)),
+    )?;
+    let account_proof = |address: Address| {
+        multiproof
+            .account_proof(address, &[])
+            .map(|proof| proof.proof)
+            .map_err(|error| ValidationApiError::AdjustmentData(error.to_string()))
+    };
+
+    let (el_transactions_root, el_placeholder_transaction_proof) =
+        ordered_trie_proof(transactions, placeholder_index, |tx, buf| tx.encode_2718(buf));
+    let (receipts_root, el_placeholder_receipt_proof) =
+        ordered_trie_proof(receipts, placeholder_index, |receipt, buf| {
+            receipt.with_bloom_ref().encode_2718(buf)
+        });
+
+    let header = block.header();
+    if el_transactions_root != header.transactions_root() {
+        return Err(ValidationApiError::AdjustmentData(format!(
+            "transactions root mismatch: {}",
+            GotExpected { got: el_transactions_root, expected: header.transactions_root() }
+        )));
+    }
+    if receipts_root != header.receipts_root() {
+        return Err(ValidationApiError::AdjustmentData(format!(
+            "receipts root mismatch: {}",
+            GotExpected { got: receipts_root, expected: header.receipts_root() }
+        )));
+    }
+    let el_withdrawals_root = header.withdrawals_root().ok_or_else(|| {
+        ValidationApiError::AdjustmentData("block has no withdrawals root".into())
+    })?;
+
+    let pre_payment_logs_bloom =
+        receipts[..placeholder_index].iter().fold(Bloom::default(), |mut bloom, receipt| {
+            bloom.accrue_bloom(&receipt.bloom());
+            bloom
+        });
+    let placeholder_gas_used = receipts[placeholder_index].cumulative_gas_used() -
+        placeholder_index
+            .checked_sub(1)
+            .map_or(0, |previous| receipts[previous].cumulative_gas_used());
+
+    Ok(AdjustmentData {
+        state_root: header.state_root(),
+        receipts_root,
+        el_transactions_root,
+        el_withdrawals_root,
+        builder_address: builder,
+        builder_proof: account_proof(builder)?,
+        fee_recipient_address: fee_recipient,
+        fee_recipient_proof: account_proof(fee_recipient)?,
+        fee_payer_address: fee_payer,
+        fee_payer_proof: account_proof(fee_payer)?,
+        el_placeholder_transaction_proof,
+        el_placeholder_receipt_proof,
+        pre_payment_logs_bloom,
+        placeholder_gas_used,
+    })
+}
+
+/// Key of the `index`th item of an index-keyed trie.
+fn index_key(index: usize) -> Nibbles {
+    Nibbles::unpack(alloy_rlp::encode_fixed_size(&index))
+}
+
+/// Root of the index-keyed trie over `items` and the proof of the `target`th item.
+///
+/// Leaves are added in `ordered_trie_root_with_encoder`'s order, which rotates index 0 to the
+/// end so that keys reach the hash builder sorted.
+fn ordered_trie_proof<T>(
+    items: &[T],
+    target: usize,
+    encode: impl Fn(&T, &mut Vec<u8>),
+) -> (B256, Vec<Bytes>) {
+    let target_key = index_key(target);
+    let mut hash_builder =
+        HashBuilder::default().with_proof_retainer(ProofRetainer::new(vec![target_key]));
+    let mut value = Vec::new();
+
+    for position in 0..items.len() {
+        let index = adjust_index_for_rlp(position, items.len());
+        value.clear();
+        encode(&items[index], &mut value);
+        hash_builder.add_leaf(index_key(index), &value);
+    }
+
+    let root = hash_builder.root();
+    let proof = hash_builder
+        .take_proof_nodes()
+        .matching_nodes_sorted(&target_key)
+        .into_iter()
+        .map(|(_, node)| node)
+        .collect();
+
+    (root, proof)
+}
+
+/// `alloy_trie::root::adjust_index_for_rlp`, which is not re-exported.
+const fn adjust_index_for_rlp(i: usize, len: usize) -> usize {
+    if i > 0x7f {
+        i
+    } else if i == 0x7f || i + 1 == len {
+        0
+    } else {
+        i + 1
     }
 }
 
@@ -902,6 +1124,22 @@ where
         let this = self.clone();
         let validation = async move { Self::validate_builder_submission_v6(&this, request).await };
         self.spawn_validation(validation).await
+    }
+
+    /// Validates a block submitted to the relay and proves what its payment adjustment touches
+    async fn get_adjustment_data(
+        &self,
+        request: AdjustmentDataRequest,
+    ) -> RpcResult<AdjustmentData> {
+        let this = self.clone();
+        let (tx, rx) = oneshot::channel();
+
+        self.task_spawner.spawn_blocking_task(async move {
+            let result = Self::adjustment_data(&this, request).await.map_err(ErrorObject::from);
+            let _ = tx.send(result);
+        });
+
+        rx.await.map_err(|_| internal_rpc_err("Internal blocking task error"))?
     }
 }
 
@@ -1069,6 +1307,10 @@ pub enum ValidationApiError {
     MissingParentBlock,
     #[error("block is too old, outside validation window")]
     BlockTooOld,
+    #[error(
+        "parent is not the current tip; adjustment data is only served for blocks built on head"
+    )]
+    ParentNotTip,
     #[error("could not verify proposer payment")]
     ProposerPayment,
     #[error("invalid blobs bundle")]
@@ -1077,6 +1319,8 @@ pub enum ValidationApiError {
     InvalidBlockAccessList(alloy_rlp::Error),
     #[error("block accesses blacklisted address: {_0}")]
     Blacklist(Address),
+    #[error("adjustment data: {_0}")]
+    AdjustmentData(String),
     #[error(transparent)]
     Blob(#[from] BlobTransactionValidationError),
     #[error(transparent)]
@@ -1096,6 +1340,7 @@ impl From<ValidationApiError> for ErrorObject<'static> {
             ValidationApiError::GasUsedMismatch(_) |
             ValidationApiError::ParentHashMismatch(_) |
             ValidationApiError::BlockHashMismatch(_) |
+            ValidationApiError::ParentNotTip |
             ValidationApiError::Blacklist(_) |
             ValidationApiError::ProposerPayment |
             ValidationApiError::InvalidBlobsBundle |
@@ -1109,6 +1354,7 @@ impl From<ValidationApiError> for ErrorObject<'static> {
             ValidationApiError::MissingLatestBlock |
             ValidationApiError::MissingParentBlock |
             ValidationApiError::BlockTooOld |
+            ValidationApiError::AdjustmentData(_) |
             ValidationApiError::Consensus(_) |
             ValidationApiError::Provider(_) => internal_rpc_err(error.to_string()),
             ValidationApiError::Execution(err) => match err {
@@ -1136,19 +1382,26 @@ pub(crate) struct ValidationMetrics {
 #[cfg(test)]
 mod tests {
     use super::{
-        distribution_value_to, hash_disallow_list, parse_payment_forwarders,
-        payment_forwarder_recipient, validate_message_against_payload, AddressSet,
-        BuilderBlockValidationRequestV6, CachedReads, TransactionFilter, ValidationApi,
-        ValidationApiConfig, ValidationApiError, DEFAULT_PAYMENT_FORWARDERS, PAYMENT_FORWARDERS,
-        PAYMENT_FORWARDER_CALLDATA_LEN, SAFE_EXECUTION_SUCCESS_TOPIC,
+        build_adjustment_data, distribution_value_to, hash_disallow_list, index_key,
+        parse_payment_forwarders, payment_forwarder_recipient, validate_message_against_payload,
+        AddressSet, AdjustmentDataRequest, BuilderBlockValidationRequestV6, CachedReads,
+        TransactionFilter, ValidationApi, ValidationApiConfig, ValidationApiError,
+        DEFAULT_PAYMENT_FORWARDERS, PAYMENT_FORWARDERS, PAYMENT_FORWARDER_CALLDATA_LEN,
+        SAFE_EXECUTION_SUCCESS_TOPIC,
     };
-    use alloy_consensus::{BlockHeader, Header, TxEip1559};
+    use alloy_consensus::{
+        constants::KECCAK_EMPTY,
+        proofs::{calculate_transaction_root, ordered_trie_root_with_encoder},
+        BlockHeader, Header, TxEip1559, TxReceipt,
+    };
     use alloy_eips::{
+        eip2718::Encodable2718,
         eip7002::WithdrawalRequest,
         eip8282::{BuilderDepositRequest, BuilderExitRequest},
     };
+    use alloy_genesis::{Genesis, GenesisAccount};
     use alloy_primitives::{
-        address, b256, hex, keccak256, Address, Bytes, FixedBytes, TxKind, B256, U256,
+        address, b256, hex, keccak256, Address, Bloom, Bytes, FixedBytes, TxKind, B256, U256,
     };
     use alloy_rpc_types_beacon::{
         relay::{BidTrace, SignedBidSubmissionV6},
@@ -1161,9 +1414,10 @@ mod tests {
     use evm2::evm::AccountInfo;
     use reth_chainspec::ChainSpecBuilder;
     use reth_consensus::noop::NoopConsensus;
+    use reth_db_common::init::init_genesis;
     use reth_engine_primitives::PayloadValidator;
     use reth_ethereum_engine_primitives::EthPayloadTypes;
-    use reth_ethereum_primitives::{Block, BlockBody, Transaction};
+    use reth_ethereum_primitives::{Block, BlockBody, EthPrimitives, Transaction};
     use reth_evm::{database::StateProviderDatabase, execute::Executor, ConfigureEvm};
     use reth_evm_ethereum::EthEvmConfig;
     use reth_execution_types::BlockExecutionOutput;
@@ -1171,11 +1425,20 @@ mod tests {
     use reth_primitives_traits::{
         crypto::secp256k1::public_key_to_address, RecoveredBlock, SealedBlock, SealedHeader,
     };
-    use reth_provider::test_utils::{ExtendedAccount, MockEthProvider};
-    use reth_storage_api::StateProviderFactory;
+    use reth_provider::{
+        providers::BlockchainProvider,
+        test_utils::{
+            create_test_provider_factory_with_chain_spec, ExtendedAccount, MockEthProvider,
+        },
+    };
+    use reth_storage_api::{HashedPostStateProvider, StateProviderFactory, StateRootProvider};
     use reth_tasks::Runtime;
     use reth_testing_utils::generators;
-    use reth_trie_common::bundle_state::{AccountStatus, BundleAccount, BundleState};
+    use reth_trie_common::{
+        bundle_state::{AccountStatus, BundleAccount, BundleState},
+        proof::verify_proof,
+        Nibbles, TrieAccount, EMPTY_ROOT_HASH,
+    };
     use std::{collections::HashMap, sync::Arc};
 
     fn test_execution_payload() -> ExecutionPayload {
@@ -2401,6 +2664,34 @@ mod tests {
         );
     }
 
+    /// Adjustment data is refused before execution for a submission whose parent is no longer
+    /// the tip: a sibling imported at the same height makes the latest header differ.
+    #[tokio::test]
+    async fn adjustment_data_refuses_a_parent_that_is_not_the_tip() {
+        let (provider, request, block, _) = v6_submission_with_one_sender();
+        let sibling = SealedHeader::seal_slow(Header {
+            parent_hash: block.parent_hash(),
+            number: block.number(),
+            gas_limit: block.gas_limit(),
+            timestamp: block.timestamp() + 1,
+            ..Default::default()
+        });
+        provider.add_block(
+            sibling.hash(),
+            Block { header: sibling.clone_header(), body: Default::default() },
+        );
+
+        let err = v6_validation_api(provider, block, AddressSet::default())
+            .adjustment_data(AdjustmentDataRequest {
+                request,
+                fee_payer: Address::repeat_byte(0x22),
+            })
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, ValidationApiError::ParentNotTip), "unexpected error: {err}");
+    }
+
     /// Execution state for a block in which `address` ended up poorer than it started.
     fn fee_recipient_spent(address: Address) -> BundleState {
         let balance =
@@ -2417,5 +2708,146 @@ mod tests {
             },
         );
         state
+    }
+
+    /// The proofs the adjustment endpoint returns verify against the roots it returns, with the
+    /// leaves the relay will decode: the three accounts as they stand after the block, the
+    /// placeholder transaction and its receipt.
+    #[test]
+    fn adjustment_data_proofs_verify_against_their_roots() {
+        let base_fee: u64 = 7;
+        let funding = U256::from(10u128.pow(18));
+        let placeholder_value = U256::from(5);
+
+        let mut rng = generators::rng();
+        let builder_key = generators::generate_key(&mut rng);
+        let builder = public_key_to_address(builder_key.public_key());
+        let fee_recipient = Address::repeat_byte(0x11);
+        let fee_payer = Address::repeat_byte(0x22);
+
+        let genesis = Genesis::default()
+            .with_gas_limit(30_000_000)
+            .with_base_fee(Some(base_fee as u128))
+            .extend_accounts([
+                (builder, GenesisAccount::default().with_balance(funding)),
+                (fee_payer, GenesisAccount::default().with_balance(funding)),
+            ]);
+        let chain_spec =
+            Arc::new(ChainSpecBuilder::mainnet().cancun_activated().genesis(genesis).build());
+        let factory = create_test_provider_factory_with_chain_spec(chain_spec.clone());
+        init_genesis(&factory).unwrap();
+        let state = BlockchainProvider::new(factory).unwrap().latest().unwrap();
+
+        let transfer = |nonce, to, value| {
+            generators::sign_tx_with_key_pair(
+                builder_key,
+                Transaction::Eip1559(TxEip1559 {
+                    chain_id: chain_spec.chain.id(),
+                    nonce,
+                    gas_limit: 21_000,
+                    max_fee_per_gas: base_fee as u128,
+                    max_priority_fee_per_gas: 0,
+                    to: TxKind::Call(to),
+                    value,
+                    ..Default::default()
+                }),
+            )
+        };
+        let transactions = vec![
+            transfer(0, Address::repeat_byte(0x33), U256::from(1)),
+            transfer(1, fee_recipient, placeholder_value),
+        ];
+        let body = BlockBody {
+            transactions: transactions.clone(),
+            withdrawals: Some(Default::default()),
+            ..Default::default()
+        };
+        let header = Header {
+            parent_hash: chain_spec.genesis_hash(),
+            number: 1,
+            timestamp: 12,
+            gas_limit: 30_000_000,
+            base_fee_per_gas: Some(base_fee),
+            parent_beacon_block_root: Some(B256::ZERO),
+            excess_blob_gas: Some(0),
+            blob_gas_used: Some(0),
+            withdrawals_root: Some(EMPTY_ROOT_HASH),
+            transactions_root: calculate_transaction_root(&transactions),
+            ..Default::default()
+        };
+        let senders = vec![builder, builder];
+
+        let output = EthEvmConfig::new(chain_spec)
+            .batch_executor(StateProviderDatabase::new(reth_storage_api::EvmStateProviderAdapter(
+                &state,
+            )))
+            .execute(&RecoveredBlock::new_unhashed(
+                Block { header: header.clone(), body: body.clone() },
+                senders.clone(),
+            ))
+            .unwrap();
+        let receipts_root = ordered_trie_root_with_encoder(&output.receipts, |receipt, buf| {
+            receipt.with_bloom_ref().encode_2718(buf)
+        });
+        let state_root = state.state_root(state.hashed_post_state(&output.state).unwrap()).unwrap();
+        let block = RecoveredBlock::new_unhashed(
+            Block { header: Header { receipts_root, state_root, ..header }, body },
+            senders,
+        );
+
+        let data = build_adjustment_data::<EthPrimitives, _>(
+            &*state,
+            &block,
+            &output,
+            fee_recipient,
+            fee_payer,
+        )
+        .unwrap();
+
+        assert_eq!(data.state_root, state_root);
+        assert_eq!(data.receipts_root, receipts_root);
+        assert_eq!(data.el_transactions_root, block.transactions_root());
+        assert_eq!(data.el_withdrawals_root, EMPTY_ROOT_HASH);
+        assert_eq!(data.builder_address, builder);
+        assert_eq!(data.placeholder_gas_used, 21_000);
+        assert_eq!(data.pre_payment_logs_bloom, Bloom::default());
+
+        let account_leaf = |nonce: u64, balance: U256| {
+            Some(alloy_rlp::encode(TrieAccount {
+                nonce,
+                balance,
+                storage_root: EMPTY_ROOT_HASH,
+                code_hash: KECCAK_EMPTY,
+                ..Default::default()
+            }))
+        };
+        let gas_paid = U256::from(2 * 21_000 * base_fee);
+        for (address, leaf, proof) in [
+            (
+                builder,
+                account_leaf(2, funding - U256::from(1) - placeholder_value - gas_paid),
+                &data.builder_proof,
+            ),
+            (fee_recipient, account_leaf(0, placeholder_value), &data.fee_recipient_proof),
+            (fee_payer, account_leaf(0, funding), &data.fee_payer_proof),
+        ] {
+            verify_proof(state_root, Nibbles::unpack(keccak256(address)), leaf, proof)
+                .unwrap_or_else(|error| panic!("account proof of {address}: {error}"));
+        }
+
+        verify_proof(
+            data.el_transactions_root,
+            index_key(1),
+            Some(transactions[1].encoded_2718()),
+            &data.el_placeholder_transaction_proof,
+        )
+        .expect("placeholder transaction proof");
+        verify_proof(
+            data.receipts_root,
+            index_key(1),
+            Some(output.receipts[1].with_bloom_ref().encoded_2718()),
+            &data.el_placeholder_receipt_proof,
+        )
+        .expect("placeholder receipt proof");
     }
 }

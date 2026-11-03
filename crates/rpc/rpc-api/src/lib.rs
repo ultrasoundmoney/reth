@@ -60,9 +60,9 @@ pub mod servers {
         trace::TraceApiServer,
         txpool::TxPoolApiServer,
         validation::{
-            BlockSubmissionValidationApiServer, BuilderBlockValidationRequestV3,
-            BuilderBlockValidationRequestV4, BuilderBlockValidationRequestV5,
-            BuilderBlockValidationRequestV6, TransactionFilter,
+            AdjustmentData, AdjustmentDataRequest, BlockSubmissionValidationApiServer,
+            BuilderBlockValidationRequestV3, BuilderBlockValidationRequestV4,
+            BuilderBlockValidationRequestV5, BuilderBlockValidationRequestV6, TransactionFilter,
         },
         web3::Web3ApiServer,
     };
@@ -96,9 +96,9 @@ pub mod clients {
         trace::TraceApiClient,
         txpool::TxPoolApiClient,
         validation::{
-            BlockSubmissionValidationApiClient, BuilderBlockValidationRequestV3,
-            BuilderBlockValidationRequestV4, BuilderBlockValidationRequestV5,
-            BuilderBlockValidationRequestV6, TransactionFilter,
+            AdjustmentData, AdjustmentDataRequest, BlockSubmissionValidationApiClient,
+            BuilderBlockValidationRequestV3, BuilderBlockValidationRequestV4,
+            BuilderBlockValidationRequestV5, BuilderBlockValidationRequestV6, TransactionFilter,
         },
         web3::Web3ApiClient,
     };
