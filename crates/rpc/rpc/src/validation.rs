@@ -4,7 +4,7 @@ use alloy_consensus::{
 };
 use alloy_eip7928::{bal::DecodedBal, compute_block_access_list_hash};
 use alloy_eips::eip7685::RequestsOrHash;
-use alloy_primitives::{map::AddressSet, Address, B256, U256};
+use alloy_primitives::{address, b256, map::AddressSet, Address, B256, U256};
 use alloy_rpc_types_beacon::relay::{
     BidTrace, BuilderBlockValidationRequest, BuilderBlockValidationRequestV2,
 };
@@ -43,16 +43,84 @@ use reth_rpc_api::{
 };
 use reth_rpc_server_types::result::{internal_rpc_err, invalid_params_rpc_err};
 use reth_storage_api::{
-    BlockReaderIdExt, HashedPostStateProvider, StateProvider, StateProviderFactory,
+    AccountReader, BlockReaderIdExt, HashedPostStateProvider, StateProvider, StateProviderFactory,
 };
 use reth_tasks::Runtime;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::sync::Arc;
+use std::{
+    collections::HashMap,
+    sync::{Arc, LazyLock},
+};
 use tokio::sync::{oneshot, RwLock};
 use tracing::warn;
 
 mod blob_cache;
+
+/// <https://github.com/gattaca-com/helix/pull/466>.
+const DEFAULT_PAYMENT_FORWARDERS: [(Address, B256); 1] = [(
+    address!("0xFEEEEEE44046c3f61a8CC081E0918eF0de0a7ffC"),
+    b256!("0xd9f5db49d3c0a174c39701485406cd78d01dd27f73b7ef7b883e5f69d8103220"),
+)];
+
+const PAYMENT_FORWARDERS_VAR: &str = "PAYMENT_FORWARDERS";
+
+/// Accepted forwarders, as comma-separated `address:code_hash` pairs.
+///
+/// A list rather than one entry so a redeployment can be accepted alongside the old contract,
+/// instead of needing a flag day where one of the two is rejected.
+///
+/// The code hash is part of the entry and never inferred from the chain: a value call to a
+/// codeless address succeeds and keeps the value, so an address on its own would validate a
+/// payment the recipient never received.
+pub(crate) static PAYMENT_FORWARDERS: LazyLock<HashMap<Address, B256>> =
+    LazyLock::new(|| match std::env::var(PAYMENT_FORWARDERS_VAR) {
+        Ok(value) => parse_payment_forwarders(&value)
+            .unwrap_or_else(|error| panic!("{PAYMENT_FORWARDERS_VAR} is invalid: {error}")),
+        Err(_) => DEFAULT_PAYMENT_FORWARDERS.into_iter().collect(),
+    });
+
+/// Rejects an empty list: disabling forwarder payments is not a configuration we want to reach
+/// by accident, and a typo that parsed to nothing would silently demote every builder using one.
+fn parse_payment_forwarders(value: &str) -> Result<HashMap<Address, B256>, String> {
+    let forwarders = value
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| {
+            let (address, code_hash) = entry
+                .split_once(':')
+                .ok_or_else(|| format!("expected `address:code_hash`, got `{entry}`"))?;
+
+            Ok((
+                address
+                    .trim()
+                    .parse::<Address>()
+                    .map_err(|_| format!("invalid address `{address}`"))?,
+                code_hash
+                    .trim()
+                    .parse::<B256>()
+                    .map_err(|_| format!("invalid code hash `{code_hash}`"))?,
+            ))
+        })
+        .collect::<Result<HashMap<_, _>, String>>()?;
+
+    if forwarders.is_empty() {
+        return Err("no forwarders configured".to_string());
+    }
+
+    Ok(forwarders)
+}
+
+/// `[4-byte timestamp][20-byte recipient]`
+const PAYMENT_FORWARDER_CALLDATA_LEN: usize = 24;
+
+/// Trailing bytes are inert: the contract reads one calldata word and forwards nothing. Shorter
+/// input would zero-pad the recipient and burn the value, so it is rejected.
+fn payment_forwarder_recipient(input: &[u8]) -> Option<Address> {
+    (input.len() >= PAYMENT_FORWARDER_CALLDATA_LEN)
+        .then(|| Address::from_slice(&input[4..PAYMENT_FORWARDER_CALLDATA_LEN]))
+}
 
 /// The type that implements the `validation` rpc namespace trait
 #[derive(Clone, Debug, derive_more::Deref)]
@@ -374,15 +442,24 @@ where
             return Err(ValidationApiError::ProposerPayment)
         }
 
-        if tx.to() != Some(message.proposer_fee_recipient) {
+        let paid_directly =
+            tx.to() == Some(message.proposer_fee_recipient) && tx.input().is_empty();
+        let paid_via_forwarder = tx.to().is_some_and(|to| {
+            PAYMENT_FORWARDERS.get(&to).is_some_and(|code_hash| {
+                payment_forwarder_recipient(tx.input()) == Some(message.proposer_fee_recipient) &&
+                    self.provider.latest().and_then(|state| state.basic_account(&to)).is_ok_and(
+                        |account| {
+                            account.is_some_and(|account| account.bytecode_hash == Some(*code_hash))
+                        },
+                    )
+            })
+        });
+
+        if !paid_directly && !paid_via_forwarder {
             return Err(ValidationApiError::ProposerPayment)
         }
 
         if tx.value() != message.value {
-            return Err(ValidationApiError::ProposerPayment)
-        }
-
-        if !tx.input().is_empty() {
             return Err(ValidationApiError::ProposerPayment)
         }
 
@@ -861,16 +938,19 @@ pub(crate) struct ValidationMetrics {
 #[cfg(test)]
 mod tests {
     use super::{
-        hash_disallow_list, validate_message_against_payload, AddressSet,
-        BuilderBlockValidationRequestV6, TransactionFilter, ValidationApi, ValidationApiConfig,
-        ValidationApiError,
+        hash_disallow_list, parse_payment_forwarders, payment_forwarder_recipient,
+        validate_message_against_payload, AddressSet, BuilderBlockValidationRequestV6,
+        TransactionFilter, ValidationApi, ValidationApiConfig, ValidationApiError,
+        DEFAULT_PAYMENT_FORWARDERS, PAYMENT_FORWARDERS, PAYMENT_FORWARDER_CALLDATA_LEN,
     };
-    use alloy_consensus::{BlockHeader, Header};
+    use alloy_consensus::{BlockHeader, Header, TxEip1559};
     use alloy_eips::{
         eip7002::WithdrawalRequest,
         eip8282::{BuilderDepositRequest, BuilderExitRequest},
     };
-    use alloy_primitives::{address, b256, hex, Address, Bytes, FixedBytes, B256, U256};
+    use alloy_primitives::{
+        address, b256, hex, keccak256, Address, Bytes, FixedBytes, TxKind, B256, U256,
+    };
     use alloy_rpc_types_beacon::{
         relay::{BidTrace, SignedBidSubmissionV6},
         requests::ExecutionRequestsV5,
@@ -880,18 +960,24 @@ mod tests {
         ExecutionPayloadV3, ExecutionPayloadV4,
     };
     use evm2::evm::AccountInfo;
+    use reth_chainspec::ChainSpecBuilder;
     use reth_consensus::noop::NoopConsensus;
     use reth_engine_primitives::PayloadValidator;
     use reth_ethereum_engine_primitives::EthPayloadTypes;
-    use reth_ethereum_primitives::Block;
+    use reth_ethereum_primitives::{Block, BlockBody, Transaction};
+    use reth_evm::{database::StateProviderDatabase, execute::Executor, ConfigureEvm};
     use reth_evm_ethereum::EthEvmConfig;
     use reth_execution_types::BlockExecutionOutput;
     use reth_payload_primitives::NewPayloadError;
-    use reth_primitives_traits::{RecoveredBlock, SealedBlock, SealedHeader};
-    use reth_provider::test_utils::MockEthProvider;
+    use reth_primitives_traits::{
+        crypto::secp256k1::public_key_to_address, RecoveredBlock, SealedBlock, SealedHeader,
+    };
+    use reth_provider::test_utils::{ExtendedAccount, MockEthProvider};
+    use reth_storage_api::StateProviderFactory;
     use reth_tasks::Runtime;
+    use reth_testing_utils::generators;
     use reth_trie_common::bundle_state::{AccountStatus, BundleAccount, BundleState};
-    use std::sync::Arc;
+    use std::{collections::HashMap, sync::Arc};
 
     fn test_execution_payload() -> ExecutionPayload {
         ExecutionPayload::V1(ExecutionPayloadV1 {
@@ -1211,6 +1297,316 @@ mod tests {
         let decoded = ExecutionRequestsV5::try_from(&requests.to_requests()).unwrap();
 
         assert_eq!(decoded, requests);
+    }
+
+    /// 4-byte big-endian timestamp followed by the 20-byte recipient.
+    fn forwarder_calldata(recipient: Address, timestamp: u32) -> Vec<u8> {
+        let mut input = timestamp.to_be_bytes().to_vec();
+        input.extend_from_slice(recipient.as_slice());
+        input
+    }
+
+    /// The runtime deployed at `DEFAULT_PAYMENT_FORWARDERS[0]`, whose hash the entry pins.
+    const PAYMENT_FORWARDER_RUNTIME: [u8; 20] = hex!("5f358060e01c4218600f5760401cff5b5f5ffd00");
+
+    /// The contract reverts unless the calldata repeats the block timestamp, so the fixture and
+    /// its calldata have to agree on one.
+    const FORWARDER_BLOCK_TIMESTAMP: u64 = 1_786_450_919;
+
+    /// Drives `ensure_payment` over a one-transaction block that pays `call_to` the bid value,
+    /// with `runtime` deployed at `deployed_at` and the calldata built from the block's proposer
+    /// fee recipient.
+    ///
+    /// The sender is also the fee recipient, so its gas spend puts the balance delta below the
+    /// bid and validation falls through to the last-transaction path the forwarder rules live
+    /// on. Returns whether the payment transaction itself succeeded alongside the outcome, so a
+    /// rejection can be attributed to those rules rather than to a revert.
+    fn ensure_payment_over_a_forwarder_call(
+        deployed_at: Address,
+        runtime: &[u8],
+        call_to: Address,
+        calldata: impl FnOnce(Address) -> Vec<u8>,
+    ) -> (bool, Result<(), ValidationApiError>) {
+        let value = U256::from(8_594_702_506_957_281u64);
+        let base_fee: u64 = 7;
+
+        let chain_spec = Arc::new(ChainSpecBuilder::mainnet().cancun_activated().build());
+
+        let mut rng = generators::rng();
+        let key = generators::generate_key(&mut rng);
+        let fee_recipient = public_key_to_address(key.public_key());
+
+        let provider = MockEthProvider::default().with_chain_spec((*chain_spec).clone());
+        provider.add_account(
+            fee_recipient,
+            ExtendedAccount::new(0, U256::from(10).pow(U256::from(18))),
+        );
+        provider.add_account(
+            deployed_at,
+            ExtendedAccount::new(1, U256::ZERO).with_bytecode(runtime.to_vec().into()),
+        );
+
+        let tx = generators::sign_tx_with_key_pair(
+            key,
+            Transaction::Eip1559(TxEip1559 {
+                chain_id: chain_spec.chain.id(),
+                nonce: 0,
+                gas_limit: 100_000,
+                max_fee_per_gas: base_fee as u128,
+                max_priority_fee_per_gas: 0,
+                to: TxKind::Call(call_to),
+                value,
+                input: calldata(fee_recipient).into(),
+                ..Default::default()
+            }),
+        );
+
+        let header = Header {
+            timestamp: FORWARDER_BLOCK_TIMESTAMP,
+            base_fee_per_gas: Some(base_fee),
+            gas_limit: 30_000_000,
+            parent_beacon_block_root: Some(B256::ZERO),
+            excess_blob_gas: Some(0),
+            blob_gas_used: Some(0),
+            ..Default::default()
+        };
+        let block = RecoveredBlock::new_unhashed(
+            Block { header, body: BlockBody { transactions: vec![tx], ..Default::default() } },
+            vec![fee_recipient],
+        );
+
+        let evm_config = EthEvmConfig::new(chain_spec);
+        let output = evm_config
+            .batch_executor(StateProviderDatabase::new(reth_storage_api::EvmStateProviderAdapter(
+                provider.latest().unwrap(),
+            )))
+            .execute(&block)
+            .unwrap();
+        let executed = output.receipts.last().unwrap().success;
+
+        let message =
+            BidTrace { proposer_fee_recipient: fee_recipient, value, ..Default::default() };
+
+        let api: ValidationApi<_, _, EthPayloadTypes> = ValidationApi::new(
+            provider,
+            NoopConsensus::arc(),
+            evm_config,
+            ValidationApiConfig::default(),
+            Runtime::test(),
+            Arc::new(UnusedPayloadValidator),
+            None,
+        );
+
+        (executed, api.ensure_payment(&block, &output, &message))
+    }
+
+    /// Reproduces the mainnet failure at slot 14968908 end to end: a correct forwarder payment,
+    /// actually executed, where the fee recipient's own spending makes the balance-delta
+    /// shortcut miss. `ensure_payment` must accept it on the last-transaction path.
+    #[test]
+    fn ensure_payment_accepts_an_executed_forwarder_payment() {
+        let (forwarder, _) = DEFAULT_PAYMENT_FORWARDERS[0];
+
+        let (executed, outcome) = ensure_payment_over_a_forwarder_call(
+            forwarder,
+            &PAYMENT_FORWARDER_RUNTIME,
+            forwarder,
+            |fee_recipient| forwarder_calldata(fee_recipient, FORWARDER_BLOCK_TIMESTAMP as u32),
+        );
+
+        assert!(executed, "the payment executed");
+        assert!(outcome.is_ok(), "a correct forwarder payment must validate: {outcome:?}");
+    }
+
+    /// The listed address is half the entry: the very same contract, byte for byte, deployed
+    /// somewhere unlisted must not be trusted to have forwarded anything. Without this an
+    /// attacker only has to redeploy the runtime to mint accepted payments.
+    #[test]
+    fn ensure_payment_rejects_a_forwarder_payment_to_an_unlisted_address() {
+        let unlisted = Address::repeat_byte(0x42);
+        assert!(!PAYMENT_FORWARDERS.contains_key(&unlisted));
+
+        let (executed, outcome) = ensure_payment_over_a_forwarder_call(
+            unlisted,
+            &PAYMENT_FORWARDER_RUNTIME,
+            unlisted,
+            |fee_recipient| forwarder_calldata(fee_recipient, FORWARDER_BLOCK_TIMESTAMP as u32),
+        );
+
+        assert!(executed, "the forwarder ran, it is only unlisted");
+        assert!(
+            matches!(outcome, Err(ValidationApiError::ProposerPayment)),
+            "unexpected outcome: {outcome:?}"
+        );
+    }
+
+    /// The code hash is the other half: a listed address carrying anything but its own runtime
+    /// must be rejected. A value call to a contract that forwards nothing still succeeds and
+    /// keeps the value, so the address alone would validate a payment the proposer never got.
+    #[test]
+    fn ensure_payment_rejects_a_listed_forwarder_carrying_other_code() {
+        let (forwarder, code_hash) = DEFAULT_PAYMENT_FORWARDERS[0];
+        let other_runtime = hex!("00");
+        assert_ne!(keccak256(other_runtime), code_hash);
+
+        let (executed, outcome) = ensure_payment_over_a_forwarder_call(
+            forwarder,
+            &other_runtime,
+            forwarder,
+            |fee_recipient| forwarder_calldata(fee_recipient, FORWARDER_BLOCK_TIMESTAMP as u32),
+        );
+
+        assert!(executed, "the call succeeds, the value simply stays put");
+        assert!(
+            matches!(outcome, Err(ValidationApiError::ProposerPayment)),
+            "unexpected outcome: {outcome:?}"
+        );
+    }
+
+    /// The forwarder pays whoever the calldata names, which need not be the proposer.
+    #[test]
+    fn ensure_payment_rejects_a_forwarder_payment_naming_another_recipient() {
+        let (forwarder, _) = DEFAULT_PAYMENT_FORWARDERS[0];
+        let someone_else = Address::repeat_byte(0x99);
+
+        let (executed, outcome) = ensure_payment_over_a_forwarder_call(
+            forwarder,
+            &PAYMENT_FORWARDER_RUNTIME,
+            forwarder,
+            |_| forwarder_calldata(someone_else, FORWARDER_BLOCK_TIMESTAMP as u32),
+        );
+
+        assert!(executed, "the forwarder paid, just not the proposer");
+        assert!(
+            matches!(outcome, Err(ValidationApiError::ProposerPayment)),
+            "unexpected outcome: {outcome:?}"
+        );
+    }
+
+    /// Short calldata zero-pads the recipient, so the contract forwards the value to an address
+    /// nobody chose. Every truncation has to be rejected, whether the call reverts or succeeds.
+    #[test]
+    fn ensure_payment_rejects_a_forwarder_payment_with_short_calldata() {
+        let (forwarder, _) = DEFAULT_PAYMENT_FORWARDERS[0];
+
+        for len in 0..PAYMENT_FORWARDER_CALLDATA_LEN {
+            let (_, outcome) = ensure_payment_over_a_forwarder_call(
+                forwarder,
+                &PAYMENT_FORWARDER_RUNTIME,
+                forwarder,
+                |fee_recipient| {
+                    let mut input =
+                        forwarder_calldata(fee_recipient, FORWARDER_BLOCK_TIMESTAMP as u32);
+                    input.truncate(len);
+                    input
+                },
+            );
+
+            assert!(
+                matches!(outcome, Err(ValidationApiError::ProposerPayment)),
+                "accepted {len} bytes: {outcome:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn payment_forwarders_default_to_the_canonical_deployment() {
+        let expected: HashMap<Address, B256> = DEFAULT_PAYMENT_FORWARDERS.into_iter().collect();
+
+        assert_eq!(*PAYMENT_FORWARDERS, expected);
+    }
+
+    /// If this stops matching, the contract changed and its address changed with it.
+    #[test]
+    fn payment_forwarder_code_hash_matches_the_deployed_runtime() {
+        let (_, code_hash) = DEFAULT_PAYMENT_FORWARDERS[0];
+
+        assert_eq!(keccak256(PAYMENT_FORWARDER_RUNTIME), code_hash);
+    }
+
+    /// The migration case: both deployments accepted at once, each pinned to its own code hash.
+    #[test]
+    fn parse_payment_forwarders_reads_several_pairs() {
+        let old = Address::from([1u8; 20]);
+        let new = Address::from([2u8; 20]);
+        let old_hash = B256::from([3u8; 32]);
+        let new_hash = B256::from([4u8; 32]);
+
+        let parsed =
+            parse_payment_forwarders(&format!(" {old}:{old_hash} , {new}:{new_hash} ")).unwrap();
+
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed.get(&old), Some(&old_hash));
+        assert_eq!(parsed.get(&new), Some(&new_hash));
+    }
+
+    /// A typo must not silently parse to a list that accepts nothing - that would demote every
+    /// builder paying through a forwarder.
+    #[test]
+    fn parse_payment_forwarders_rejects_malformed_input() {
+        let address = Address::from([1u8; 20]);
+        let hash = B256::from([3u8; 32]);
+
+        for input in [
+            String::new(),
+            "  ,  ".to_string(),
+            format!("{address}"),
+            format!("{address}:"),
+            format!(":{hash}"),
+            format!("{address}:0xnothex"),
+            format!("notanaddress:{hash}"),
+        ] {
+            assert!(parse_payment_forwarders(&input).is_err(), "accepted `{input}`");
+        }
+    }
+
+    #[test]
+    fn payment_forwarder_recipient_reads_the_encoded_address() {
+        let recipient = Address::from([7u8; 20]);
+        let input = forwarder_calldata(recipient, 1_760_000_000);
+
+        assert_eq!(input.len(), PAYMENT_FORWARDER_CALLDATA_LEN);
+        assert_eq!(payment_forwarder_recipient(&input), Some(recipient));
+    }
+
+    #[test]
+    fn payment_forwarder_recipient_rejects_short_calldata() {
+        let recipient = Address::from([7u8; 20]);
+
+        for len in 0..PAYMENT_FORWARDER_CALLDATA_LEN {
+            let mut input = forwarder_calldata(recipient, 1_760_000_000);
+            input.truncate(len);
+
+            assert_eq!(payment_forwarder_recipient(&input), None, "accepted {len} bytes");
+        }
+    }
+
+    #[test]
+    fn payment_forwarder_recipient_ignores_trailing_calldata() {
+        let recipient = Address::from([7u8; 20]);
+
+        for extra in 1..=64usize {
+            let mut input = forwarder_calldata(recipient, 1_760_000_000);
+            input.extend(std::iter::repeat_n(0xABu8, extra));
+
+            assert_eq!(
+                payment_forwarder_recipient(&input),
+                Some(recipient),
+                "misparsed with {extra} trailing bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn payment_forwarder_recipient_ignores_the_timestamp_value() {
+        let recipient = Address::from([7u8; 20]);
+
+        for timestamp in [0u32, 1, 1_760_000_000, u32::MAX] {
+            assert_eq!(
+                payment_forwarder_recipient(&forwarder_calldata(recipient, timestamp)),
+                Some(recipient)
+            );
+        }
     }
 
     #[test]
