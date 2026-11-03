@@ -7,8 +7,6 @@ use alloy_eips::eip7685::RequestsOrHash;
 use alloy_primitives::{map::AddressSet, Address, B256, U256};
 use alloy_rpc_types_beacon::relay::{
     BidTrace, BuilderBlockValidationRequest, BuilderBlockValidationRequestV2,
-    BuilderBlockValidationRequestV3, BuilderBlockValidationRequestV4,
-    BuilderBlockValidationRequestV5, BuilderBlockValidationRequestV6,
 };
 use alloy_rpc_types_engine::{
     BlobsBundleV1, BlobsBundleV2, CancunPayloadFields, ExecutionData, ExecutionPayload,
@@ -38,7 +36,11 @@ use reth_primitives_traits::{
     block::error::SealedBlockRecoveryError, BlockBody, GotExpected, NodePrimitives, RecoveredBlock,
     SealedBlock, SealedHeaderFor,
 };
-use reth_rpc_api::BlockSubmissionValidationApiServer;
+use reth_rpc_api::{
+    BlockSubmissionValidationApiServer, BuilderBlockValidationRequestV3,
+    BuilderBlockValidationRequestV4, BuilderBlockValidationRequestV5,
+    BuilderBlockValidationRequestV6, TransactionFilter,
+};
 use reth_rpc_server_types::result::{internal_rpc_err, invalid_params_rpc_err};
 use reth_storage_api::{
     BlockReaderIdExt, HashedPostStateProvider, StateProvider, StateProviderFactory,
@@ -162,6 +164,7 @@ where
         block: RecoveredBlock<<E::Primitives as NodePrimitives>::Block>,
         message: BidTrace,
         registered_gas_limit: u64,
+        transaction_filter: TransactionFilter,
         decoded_bal: Option<DecodedBal>,
     ) -> Result<(), ValidationApiError> {
         self.validate_message_against_header(block.sealed_header(), &message)?;
@@ -169,7 +172,7 @@ where
         self.consensus.validate_header(block.sealed_header())?;
         self.consensus.validate_block_pre_execution(block.sealed_block())?;
 
-        if !self.disallow.is_empty() {
+        if !self.disallow.is_empty() && transaction_filter == TransactionFilter::OFAC {
             if self.disallow.contains(&block.beneficiary()) {
                 return Err(ValidationApiError::Blacklist(block.beneficiary()))
             }
@@ -246,7 +249,7 @@ where
                 executor.take_bal().map(|bal| compute_block_access_list_hash(&bal));
 
             let state = executor.into_state();
-            if !self.disallow.is_empty() {
+            if !self.disallow.is_empty() && transaction_filter == TransactionFilter::OFAC {
                 // Check whether the submission interacted with any blacklisted account by
                 // scanning the cached reads and the accounts changed during execution.
                 for account in request_cache.accounts.keys().chain(state.state.keys()) {
@@ -455,6 +458,7 @@ where
             block,
             request.request.message,
             request.registered_gas_limit,
+            request.transaction_filter,
             None,
         )
         .await
@@ -484,6 +488,7 @@ where
             block,
             request.request.message,
             request.registered_gas_limit,
+            request.transaction_filter,
             None,
         )
         .await
@@ -529,6 +534,7 @@ where
             block,
             request.request.message,
             request.registered_gas_limit,
+            request.transaction_filter,
             None,
         )
         .await
@@ -577,6 +583,7 @@ where
             block,
             request.request.message,
             request.registered_gas_limit,
+            request.transaction_filter,
             Some(decoded_bal),
         )
         .await
@@ -839,8 +846,9 @@ pub(crate) struct ValidationMetrics {
 #[cfg(test)]
 mod tests {
     use super::{
-        hash_disallow_list, validate_message_against_payload, AddressSet, ValidationApi,
-        ValidationApiConfig, ValidationApiError,
+        hash_disallow_list, validate_message_against_payload, AddressSet,
+        BuilderBlockValidationRequestV6, TransactionFilter, ValidationApi, ValidationApiConfig,
+        ValidationApiError,
     };
     use alloy_consensus::{BlockHeader, Header};
     use alloy_eips::{
@@ -849,7 +857,7 @@ mod tests {
     };
     use alloy_primitives::{address, b256, hex, Address, Bytes, FixedBytes, B256, U256};
     use alloy_rpc_types_beacon::{
-        relay::{BidTrace, BuilderBlockValidationRequestV6, SignedBidSubmissionV6},
+        relay::{BidTrace, SignedBidSubmissionV6},
         requests::ExecutionRequestsV5,
     };
     use alloy_rpc_types_engine::{
@@ -980,6 +988,7 @@ mod tests {
             },
             registered_gas_limit: 30_000_000,
             parent_beacon_block_root: B256::ZERO,
+            transaction_filter: TransactionFilter::None,
         }
     }
 
@@ -1312,6 +1321,90 @@ mod tests {
         )
     }
 
+    /// Returns the prepared block regardless of the payload, so a V6 request can be driven
+    /// through [`ValidationApi::validate_builder_submission_v6`] without building a payload that
+    /// converts.
+    #[derive(Debug)]
+    struct FixedBlockPayloadValidator(SealedBlock<Block>);
+
+    impl PayloadValidator<EthPayloadTypes> for FixedBlockPayloadValidator {
+        type Block = Block;
+
+        fn convert_payload_to_block(
+            &self,
+            _payload: ExecutionData,
+        ) -> Result<SealedBlock<Self::Block>, NewPayloadError> {
+            Ok(self.0.clone())
+        }
+    }
+
+    /// A V6 submission carrying one transaction, with the sender's address returned so it can be
+    /// put on the disallow list.
+    fn v6_submission_with_one_sender(
+    ) -> (MockEthProvider, BuilderBlockValidationRequestV6, SealedBlock<Block>, Address) {
+        let provider = MockEthProvider::default();
+
+        let parent =
+            SealedHeader::seal_slow(Header { gas_limit: 30_000_000, ..Default::default() });
+        provider.add_block(
+            parent.hash(),
+            Block { header: parent.clone_header(), body: Default::default() },
+        );
+
+        let mut rng = generators::rng();
+        let key = generators::generate_key(&mut rng);
+        let sender = public_key_to_address(key.public_key());
+        let tx = generators::sign_tx_with_key_pair(
+            key,
+            Transaction::Eip1559(TxEip1559 {
+                chain_id: 1,
+                nonce: 0,
+                gas_limit: 21_000,
+                max_fee_per_gas: 0,
+                max_priority_fee_per_gas: 0,
+                to: TxKind::Call(Address::repeat_byte(0x99)),
+                value: U256::ZERO,
+                ..Default::default()
+            }),
+        );
+
+        let header = Header {
+            parent_hash: parent.hash(),
+            number: parent.number() + 1,
+            gas_limit: parent.gas_limit(),
+            timestamp: parent.timestamp() + 12,
+            ..Default::default()
+        };
+        let block = SealedBlock::seal_slow(Block {
+            header,
+            body: BlockBody { transactions: vec![tx], ..Default::default() },
+        });
+
+        let mut request = test_v6_request();
+        request.registered_gas_limit = block.gas_limit();
+        // The V6 handler decodes the block access list before anything else, so it has to be
+        // well-formed RLP; an empty list is enough here.
+        request.request.execution_payload.block_access_list = Bytes::from_static(&[0xc0]);
+
+        let payload = &mut request.request.execution_payload.payload_inner.payload_inner;
+        payload.payload_inner.parent_hash = block.parent_hash();
+        payload.payload_inner.block_hash = block.hash();
+        payload.payload_inner.gas_limit = block.gas_limit();
+        payload.payload_inner.gas_used = block.gas_used();
+
+        request.request.message = BidTrace {
+            parent_hash: block.parent_hash(),
+            block_hash: block.hash(),
+            gas_limit: block.gas_limit(),
+            gas_used: block.gas_used(),
+            ..Default::default()
+        };
+
+        provider.state_roots.lock().push(block.state_root());
+
+        (provider, request, block, sender)
+    }
+
     /// A submission whose payload pays the proposer nothing, like a trustless ePBS bid: there the
     /// payment settles from the builder's stake on the consensus layer.
     fn payment_free_submission() -> (MockEthProvider, RecoveredBlock<Block>, BidTrace) {
@@ -1372,7 +1465,13 @@ mod tests {
         );
         message.block_hash = block.hash();
         let error = test_validation_api(provider)
-            .validate_message_against_block(block, message, parent_block.gas_limit(), None)
+            .validate_message_against_block(
+                block,
+                message,
+                parent_block.gas_limit(),
+                TransactionFilter::None,
+                None,
+            )
             .await
             .unwrap_err();
         assert!(
@@ -1392,7 +1491,13 @@ mod tests {
         let registered_gas_limit = block.gas_limit();
 
         let err = test_validation_api(provider)
-            .validate_message_against_block(block, message, registered_gas_limit, None)
+            .validate_message_against_block(
+                block,
+                message,
+                registered_gas_limit,
+                TransactionFilter::None,
+                None,
+            )
             .await
             .unwrap_err();
 
@@ -1406,7 +1511,13 @@ mod tests {
         message.value = U256::ZERO;
 
         test_validation_api(provider)
-            .validate_message_against_block(block, message, registered_gas_limit, None)
+            .validate_message_against_block(
+                block,
+                message,
+                registered_gas_limit,
+                TransactionFilter::None,
+                None,
+            )
             .await
             .unwrap();
     }
@@ -1428,6 +1539,58 @@ mod tests {
         test_validation_api(provider)
             .ensure_payment(block.sealed_block(), &output, &message)
             .unwrap();
+    }
+
+    fn v6_validation_api(
+        provider: MockEthProvider,
+        block: SealedBlock<Block>,
+        disallow: AddressSet,
+    ) -> ValidationApi<MockEthProvider, EthEvmConfig, EthPayloadTypes> {
+        ValidationApi::new(
+            provider,
+            NoopConsensus::arc(),
+            EthEvmConfig::mainnet(),
+            ValidationApiConfig { disallow, ..Default::default() },
+            Runtime::test(),
+            Arc::new(FixedBlockPayloadValidator(block)),
+            None,
+        )
+    }
+
+    /// The relay sends `transaction_filter` on every submission version, so the V6 handler has to
+    /// honour it: a submission whose only transaction comes from a disallowed sender must be
+    /// rejected when the request asks for OFAC filtering.
+    #[tokio::test]
+    async fn test_v6_applies_the_ofac_transaction_filter() {
+        let (provider, mut request, block, sender) = v6_submission_with_one_sender();
+        request.transaction_filter = TransactionFilter::OFAC;
+
+        let err = v6_validation_api(provider, block, AddressSet::from_iter([sender]))
+            .validate_builder_submission_v6(request)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, ValidationApiError::Blacklist(address) if address == sender),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// The counterpart: the same submission, the same disallow list, filtering off. The sender
+    /// must get past the blacklist, so the rejection above is the filter and not the fixture.
+    #[tokio::test]
+    async fn test_v6_skips_the_filter_when_not_requested() {
+        let (provider, mut request, block, sender) = v6_submission_with_one_sender();
+        request.transaction_filter = TransactionFilter::None;
+
+        let result = v6_validation_api(provider, block, AddressSet::from_iter([sender]))
+            .validate_builder_submission_v6(request)
+            .await;
+
+        assert!(
+            !matches!(result, Err(ValidationApiError::Blacklist(_))),
+            "the disallow list was consulted without the filter: {result:?}"
+        );
     }
 
     /// Execution state for a block in which `address` ended up poorer than it started.
