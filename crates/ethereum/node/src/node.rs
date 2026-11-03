@@ -379,10 +379,14 @@ where
             flashbots_config.disallow = fetch_disallow_or_exit(url).await;
         }
 
+        let mut validation_evm_config = ctx.node.evm_config().clone();
+        if ctx.config.rpc.builder_validation_jit {
+            validation_evm_config = validation_evm_config.with_jit_support();
+        }
         let validation_api = ValidationApi::<_, _, <N::Types as NodeTypes>::Payload>::new(
             ctx.node.provider().clone(),
             Arc::new(ctx.node.consensus().clone()),
-            ctx.node.evm_config().clone(),
+            validation_evm_config,
             flashbots_config,
             ctx.node.task_executor().clone(),
             Arc::new(EthereumEngineValidator::new(ctx.config.chain.clone())),

@@ -760,6 +760,13 @@ pub struct RpcServerArgs {
     #[arg(long = "ssz-block-validation.port", value_name = "PORT", default_value = Resettable::from(DefaultRpcServerArgs::get_global().ssz_block_validation_port.map(|v| v.to_string().into())))]
     pub ssz_block_validation_port: Option<u16>,
 
+    /// Let the block validation API execute JIT-compiled bytecode.
+    ///
+    /// Only takes effect in a binary built with the `jit` feature and with JIT compilation enabled
+    /// (`--jit` or the `reth_jit` RPC method).
+    #[arg(long = "builder.validation-jit", default_value_t = false)]
+    pub builder_validation_jit: bool,
+
     /// State cache configuration.
     #[command(flatten)]
     pub rpc_state_cache: RpcStateCacheArgs,
@@ -1040,6 +1047,7 @@ impl Default for RpcServerArgs {
             rpc_state_cache,
             gas_price_oracle,
             rpc_send_raw_transaction_sync_timeout,
+            builder_validation_jit: false,
             testing_skip_invalid_transactions: false,
             testing_gas_limit: None,
             rpc_force_blob_sidecar_upcasting: false,
@@ -1370,6 +1378,7 @@ mod tests {
                 default_suggested_fee: None,
             },
             rpc_send_raw_transaction_sync_timeout: std::time::Duration::from_secs(30),
+            builder_validation_jit: true,
             testing_skip_invalid_transactions: true,
             testing_gas_limit: None,
             rpc_force_blob_sidecar_upcasting: false,
@@ -1465,6 +1474,7 @@ mod tests {
             "60",
             "--rpc.send-raw-transaction-sync-timeout",
             "30s",
+            "--builder.validation-jit",
             "--testing.skip-invalid-transactions",
         ])
         .args;
