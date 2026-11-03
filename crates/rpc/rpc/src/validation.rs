@@ -1288,6 +1288,17 @@ mod tests {
         parent: &SealedHeader,
         calls: &[Address],
     ) -> (RecoveredBlock<Block>, BidTrace) {
+        submission_calling_in_slot(provider, parent, calls, 1)
+    }
+
+    /// Builds a submission for the slot `slots_after_parent` slots after `parent`, so a value
+    /// above 1 models a slot that follows missed slots.
+    fn submission_calling_in_slot(
+        provider: &MockEthProvider,
+        parent: &SealedHeader,
+        calls: &[Address],
+        slots_after_parent: u64,
+    ) -> (RecoveredBlock<Block>, BidTrace) {
         let transactions = calls
             .iter()
             .enumerate()
@@ -1309,7 +1320,7 @@ mod tests {
             parent_hash: parent.hash(),
             number: parent.number() + 1,
             gas_limit: parent.gas_limit(),
-            timestamp: parent.timestamp() + 12,
+            timestamp: parent.timestamp() + 12 * slots_after_parent,
             ..Default::default()
         };
         let block = RecoveredBlock::new_unhashed(
@@ -1323,6 +1334,7 @@ mod tests {
         provider.state_roots.lock().push(block.state_root());
 
         let message = BidTrace {
+            slot: slots_after_parent,
             parent_hash: block.parent_hash(),
             block_hash: block.hash(),
             gas_limit: block.gas_limit(),
@@ -1372,9 +1384,11 @@ mod tests {
     async fn test_unfiltered_read_does_not_reject_a_later_filtered_submission() {
         let blocked = Address::repeat_byte(0xbb);
         let (provider, parent, _) = balance_reader_parent(blocked);
+        // Slot N (unfiltered) is missed, so slot N+1 (filtered) builds on the same parent.
         let (unfiltered_block, unfiltered_message) =
-            submission_calling(&provider, &parent, &[blocked]);
-        let (filtered_block, filtered_message) = submission_calling(&provider, &parent, &[]);
+            submission_calling_in_slot(&provider, &parent, &[blocked], 1);
+        let (filtered_block, filtered_message) =
+            submission_calling_in_slot(&provider, &parent, &[], 2);
         let registered_gas_limit = parent.gas_limit();
 
         let api = test_validation_api_with_disallow(provider, AddressSet::from_iter([blocked]));
