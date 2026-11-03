@@ -4,11 +4,9 @@ use alloy_consensus::{
 };
 use alloy_eip7928::{bal::DecodedBal, compute_block_access_list_hash};
 use alloy_eips::eip7685::RequestsOrHash;
-use alloy_primitives::{map::AddressSet, Address, B256, U256};
+use alloy_primitives::{address, b256, map::AddressSet, Address, B256, U256};
 use alloy_rpc_types_beacon::relay::{
     BidTrace, BuilderBlockValidationRequest, BuilderBlockValidationRequestV2,
-    BuilderBlockValidationRequestV3, BuilderBlockValidationRequestV4,
-    BuilderBlockValidationRequestV5, BuilderBlockValidationRequestV6,
 };
 use alloy_rpc_types_engine::{
     BlobsBundleV1, BlobsBundleV2, CancunPayloadFields, ExecutionData, ExecutionPayload,
@@ -16,6 +14,11 @@ use alloy_rpc_types_engine::{
 };
 use async_trait::async_trait;
 use core::fmt;
+use evm2::{
+    bytecode::Bytecode,
+    evm::{AccountInfo, Database},
+    interpreter::Word,
+};
 use jsonrpsee::core::RpcResult;
 use jsonrpsee_types::error::ErrorObject;
 use reth_chainspec::{ChainSpecProvider, EthereumHardforks};
@@ -36,21 +39,186 @@ use reth_metrics::{
 use reth_payload_primitives::{NewPayloadError, PayloadTypes};
 use reth_primitives_traits::{
     block::error::SealedBlockRecoveryError, BlockBody, GotExpected, NodePrimitives, RecoveredBlock,
-    SealedBlock, SealedHeaderFor,
+    SealedHeaderFor,
 };
-use reth_rpc_api::BlockSubmissionValidationApiServer;
+use reth_rpc_api::{
+    BlockSubmissionValidationApiServer, BuilderBlockValidationRequestV3,
+    BuilderBlockValidationRequestV4, BuilderBlockValidationRequestV5,
+    BuilderBlockValidationRequestV6, TransactionFilter,
+};
 use reth_rpc_server_types::result::{internal_rpc_err, invalid_params_rpc_err};
 use reth_storage_api::{
-    BlockReaderIdExt, HashedPostStateProvider, StateProvider, StateProviderFactory,
+    AccountReader, BlockReaderIdExt, HashedPostStateProvider, StateProvider, StateProviderFactory,
 };
 use reth_tasks::Runtime;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::sync::Arc;
+use std::{
+    collections::HashMap,
+    sync::{Arc, LazyLock},
+};
 use tokio::sync::{oneshot, RwLock};
 use tracing::warn;
 
 mod blob_cache;
+
+/// <https://github.com/gattaca-com/helix/pull/466>.
+const DEFAULT_PAYMENT_FORWARDERS: [(Address, B256); 1] = [(
+    address!("0xFEEEEEE44046c3f61a8CC081E0918eF0de0a7ffC"),
+    b256!("0xd9f5db49d3c0a174c39701485406cd78d01dd27f73b7ef7b883e5f69d8103220"),
+)];
+
+const PAYMENT_FORWARDERS_VAR: &str = "PAYMENT_FORWARDERS";
+
+/// Accepted forwarders, as comma-separated `address:code_hash` pairs.
+///
+/// A list rather than one entry so a redeployment can be accepted alongside the old contract,
+/// instead of needing a flag day where one of the two is rejected.
+///
+/// The code hash is part of the entry and never inferred from the chain: a value call to a
+/// codeless address succeeds and keeps the value, so an address on its own would validate a
+/// payment the recipient never received.
+pub(crate) static PAYMENT_FORWARDERS: LazyLock<HashMap<Address, B256>> =
+    LazyLock::new(|| match std::env::var(PAYMENT_FORWARDERS_VAR) {
+        Ok(value) => parse_payment_forwarders(&value)
+            .unwrap_or_else(|error| panic!("{PAYMENT_FORWARDERS_VAR} is invalid: {error}")),
+        Err(_) => DEFAULT_PAYMENT_FORWARDERS.into_iter().collect(),
+    });
+
+const MERGE_RELAY_SIGNER_VAR: &str = "MERGE_RELAY_SIGNER";
+
+pub(crate) static MERGE_RELAY_SIGNER: LazyLock<Option<Address>> =
+    LazyLock::new(|| match std::env::var(MERGE_RELAY_SIGNER_VAR) {
+        Ok(value) => Some(
+            value
+                .trim()
+                .parse()
+                .unwrap_or_else(|error| panic!("{MERGE_RELAY_SIGNER_VAR} is invalid: {error}")),
+        ),
+        Err(_) => None,
+    });
+
+/// Rejects an empty list: disabling forwarder payments is not a configuration we want to reach
+/// by accident, and a typo that parsed to nothing would silently demote every builder using one.
+fn parse_payment_forwarders(value: &str) -> Result<HashMap<Address, B256>, String> {
+    let forwarders = value
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| {
+            let (address, code_hash) = entry
+                .split_once(':')
+                .ok_or_else(|| format!("expected `address:code_hash`, got `{entry}`"))?;
+
+            Ok((
+                address
+                    .trim()
+                    .parse::<Address>()
+                    .map_err(|_| format!("invalid address `{address}`"))?,
+                code_hash
+                    .trim()
+                    .parse::<B256>()
+                    .map_err(|_| format!("invalid code hash `{code_hash}`"))?,
+            ))
+        })
+        .collect::<Result<HashMap<_, _>, String>>()?;
+
+    if forwarders.is_empty() {
+        return Err("no forwarders configured".to_string());
+    }
+
+    Ok(forwarders)
+}
+
+/// `[4-byte timestamp][20-byte recipient]`
+const PAYMENT_FORWARDER_CALLDATA_LEN: usize = 24;
+
+/// Trailing bytes are inert: the contract reads one calldata word and forwards nothing. Shorter
+/// input would zero-pad the recipient and burn the value, so it is rejected.
+fn payment_forwarder_recipient(input: &[u8]) -> Option<Address> {
+    (input.len() >= PAYMENT_FORWARDER_CALLDATA_LEN)
+        .then(|| Address::from_slice(&input[4..PAYMENT_FORWARDER_CALLDATA_LEN]))
+}
+
+/// `execTransaction(address,uint256,bytes,uint8,uint256,uint256,uint256,address,address,bytes)`
+const SAFE_EXEC_TRANSACTION_SELECTOR: [u8; 4] = [0x6a, 0x76, 0x12, 0x02];
+
+/// `multiSend(bytes)` on `MultiSendCallOnly`.
+const MULTI_SEND_SELECTOR: [u8; 4] = [0x8d, 0x80, 0xff, 0x0a];
+
+/// A packed `MultiSend` entry ahead of its data:
+/// `[1 byte operation][20 byte to][32 byte value][32 byte data length]`.
+const MULTI_SEND_ENTRY_HEADER_LEN: usize = 85;
+
+/// Reads an abi word as a length or offset, rejecting anything too wide to index with.
+fn read_abi_length(input: &[u8], at: usize) -> Option<usize> {
+    let word = input.get(at..at.checked_add(32)?)?;
+
+    if word[..24].iter().any(|byte| *byte != 0) {
+        return None;
+    }
+
+    let bytes: [u8; 8] = word[24..].try_into().ok()?;
+
+    usize::try_from(u64::from_be_bytes(bytes)).ok()
+}
+
+/// Extracts the `head_index`th argument of abi encoded `calldata`, which must be a dynamic `bytes`.
+fn abi_bytes_arg(calldata: &[u8], head_index: usize) -> Option<&[u8]> {
+    let args = calldata.get(4..)?;
+    let offset = read_abi_length(args, head_index.checked_mul(32)?)?;
+    let length = read_abi_length(args, offset)?;
+    let start = offset.checked_add(32)?;
+
+    args.get(start..start.checked_add(length)?)
+}
+
+/// Sums the value of the `MultiSend` entries paying `recipient`.
+fn multi_send_value_to(payload: &[u8], recipient: Address) -> Option<U256> {
+    let mut total = U256::ZERO;
+    let mut cursor = 0usize;
+
+    while cursor < payload.len() {
+        let to = Address::from_slice(payload.get(cursor + 1..cursor + 21)?);
+        let value = U256::from_be_slice(payload.get(cursor + 21..cursor + 53)?);
+        let data_length = read_abi_length(payload, cursor + 53)?;
+
+        if to == recipient {
+            total = total.saturating_add(value);
+        }
+
+        cursor = cursor.checked_add(MULTI_SEND_ENTRY_HEADER_LEN)?.checked_add(data_length)?;
+    }
+
+    Some(total)
+}
+
+/// `ExecutionSuccess(bytes32,uint256)`, which a Safe emits only when its inner call succeeded.
+const SAFE_EXECUTION_SUCCESS_TOPIC: B256 =
+    b256!("0x442e715f626346e8c54381002da614f62bee8d27386535b2521ec8540898556e");
+
+/// Whether `safe` reported a successful inner call in these logs.
+fn safe_execution_succeeded(logs: &[alloy_primitives::Log], safe: Address) -> bool {
+    logs.iter().any(|log| {
+        log.address == safe && log.topics().first() == Some(&SAFE_EXECUTION_SUCCESS_TOPIC)
+    })
+}
+
+/// Value the relay's distribution pays `recipient`, or `None` when `input` is not a Safe
+/// `execTransaction` wrapping a `multiSend`.
+fn distribution_value_to(input: &[u8], recipient: Address) -> Option<U256> {
+    if input.get(..4)? != SAFE_EXEC_TRANSACTION_SELECTOR {
+        return None;
+    }
+
+    let inner = abi_bytes_arg(input, 2)?;
+
+    if inner.get(..4)? != MULTI_SEND_SELECTOR {
+        return None;
+    }
+
+    multi_send_value_to(abi_bytes_arg(inner, 0)?, recipient)
+}
 
 /// The type that implements the `validation` rpc namespace trait
 #[derive(Clone, Debug, derive_more::Deref)]
@@ -81,27 +249,30 @@ where
     ) -> Self {
         let ValidationApiConfig { disallow, validation_window } = config;
 
+        let metrics = ValidationMetrics::default();
+        record_disallow_metrics(&metrics, &disallow);
+
         let inner = Arc::new(ValidationApiInner {
             provider,
             consensus,
             payload_validator,
             evm_config,
-            disallow,
+            disallow: parking_lot::RwLock::new(Arc::new(disallow)),
             validation_window,
             cached_state: Default::default(),
             validated_blobs: Default::default(),
             task_spawner,
             sender_recovery_cache,
-            metrics: Default::default(),
+            metrics,
         });
 
-        inner.metrics.disallow_size.set(inner.disallow.len() as f64);
-
-        let disallow_hash = hash_disallow_list(&inner.disallow);
-        let hash_gauge = gauge!("builder_validation_disallow_hash", "hash" => disallow_hash);
-        hash_gauge.set(1.0);
-
         Self { inner }
+    }
+
+    /// Replaces the disallow list (e.g. from a periodic refresh) and re-emits its metrics.
+    pub fn update_disallow(&self, disallow: AddressSet) {
+        record_disallow_metrics(&self.metrics, &disallow);
+        *self.disallow.write() = Arc::new(disallow);
     }
 
     /// Returns the cached reads for the given head hash.
@@ -162,6 +333,7 @@ where
         block: RecoveredBlock<<E::Primitives as NodePrimitives>::Block>,
         message: BidTrace,
         registered_gas_limit: u64,
+        transaction_filter: TransactionFilter,
         decoded_bal: Option<DecodedBal>,
     ) -> Result<(), ValidationApiError> {
         self.validate_message_against_header(block.sealed_header(), &message)?;
@@ -169,19 +341,22 @@ where
         self.consensus.validate_header(block.sealed_header())?;
         self.consensus.validate_block_pre_execution(block.sealed_block())?;
 
-        if !self.disallow.is_empty() {
-            if self.disallow.contains(&block.beneficiary()) {
+        let disallow =
+            (transaction_filter == TransactionFilter::OFAC).then(|| self.disallow.read().clone());
+
+        if let Some(disallow) = &disallow {
+            if disallow.contains(&block.beneficiary()) {
                 return Err(ValidationApiError::Blacklist(block.beneficiary()))
             }
-            if self.disallow.contains(&message.proposer_fee_recipient) {
+            if disallow.contains(&message.proposer_fee_recipient) {
                 return Err(ValidationApiError::Blacklist(message.proposer_fee_recipient))
             }
             for (sender, tx) in block.senders_iter().zip(block.body().transactions()) {
-                if self.disallow.contains(sender) {
+                if disallow.contains(sender) {
                     return Err(ValidationApiError::Blacklist(*sender))
                 }
                 if let Some(to) = tx.to() &&
-                    self.disallow.contains(&to)
+                    disallow.contains(&to)
                 {
                     return Err(ValidationApiError::Blacklist(to))
                 }
@@ -230,11 +405,14 @@ where
         let state_provider = self.provider.state_by_block_hash(parent_header_hash)?;
 
         let mut request_cache = self.cached_reads(parent_header_hash).await;
+        let mut accessed_accounts = AddressSet::default();
 
         let (output, block_access_list_hash) = {
             let cached_db = request_cache
                 .as_db_mut(StateProviderDatabase::new((&state_provider).into_evm_state_provider()));
-            let mut executor = self.evm_config.batch_executor(cached_db);
+            let recording_db =
+                AccountRecordingDb { db: cached_db, accounts: &mut accessed_accounts };
+            let mut executor = self.evm_config.batch_executor(recording_db);
 
             let result = executor.execute_one(&block)?;
 
@@ -246,11 +424,11 @@ where
                 executor.take_bal().map(|bal| compute_block_access_list_hash(&bal));
 
             let state = executor.into_state();
-            if !self.disallow.is_empty() {
-                // Check whether the submission interacted with any blacklisted account by
-                // scanning the cached reads and the accounts changed during execution.
-                for account in request_cache.accounts.keys().chain(state.state.keys()) {
-                    if self.disallow.contains(account) {
+            if let Some(disallow) = &disallow {
+                // `request_cache` also holds reads of earlier submissions on the same parent, so
+                // only this execution's own reads are checked.
+                for account in accessed_accounts.iter().chain(state.state.keys()) {
+                    if disallow.contains(account) {
                         return Err(ValidationApiError::Blacklist(*account))
                     }
                 }
@@ -321,7 +499,7 @@ where
     /// to checking the latest block transaction.
     fn ensure_payment(
         &self,
-        block: &SealedBlock<<E::Primitives as NodePrimitives>::Block>,
+        block: &RecoveredBlock<<E::Primitives as NodePrimitives>::Block>,
         output: &BlockExecutionOutput<<E::Primitives as NodePrimitives>::Receipt>,
         message: &BidTrace,
     ) -> Result<(), ValidationApiError> {
@@ -365,15 +543,39 @@ where
             return Err(ValidationApiError::ProposerPayment)
         }
 
-        if tx.to() != Some(message.proposer_fee_recipient) {
+        // A merged block pays the proposer across two transactions: the base builder's payment,
+        // wherever merging left it in the block, and the relay's own distribution appended after
+        // it. Neither check above can see that. The balance delta misses it whenever the fee
+        // recipient forwards what it receives.
+        if let Some(relay_signer) = *MERGE_RELAY_SIGNER &&
+            block.senders_iter().last() == Some(&relay_signer)
+        {
+            let credited =
+                self.credited_to_fee_recipient(block, output, message.proposer_fee_recipient);
+
+            return (credited >= message.value)
+                .then_some(())
+                .ok_or(ValidationApiError::ProposerPayment);
+        }
+
+        let paid_directly =
+            tx.to() == Some(message.proposer_fee_recipient) && tx.input().is_empty();
+        let paid_via_forwarder = tx.to().is_some_and(|to| {
+            PAYMENT_FORWARDERS.get(&to).is_some_and(|code_hash| {
+                payment_forwarder_recipient(tx.input()) == Some(message.proposer_fee_recipient) &&
+                    self.provider.latest().and_then(|state| state.basic_account(&to)).is_ok_and(
+                        |account| {
+                            account.is_some_and(|account| account.bytecode_hash == Some(*code_hash))
+                        },
+                    )
+            })
+        });
+
+        if !paid_directly && !paid_via_forwarder {
             return Err(ValidationApiError::ProposerPayment)
         }
 
         if tx.value() != message.value {
-            return Err(ValidationApiError::ProposerPayment)
-        }
-
-        if !tx.input().is_empty() {
             return Err(ValidationApiError::ProposerPayment)
         }
 
@@ -384,6 +586,54 @@ where
         }
 
         Ok(())
+    }
+
+    /// Sums what the block credits `fee_recipient` through payment shaped transactions: plain
+    /// transfers, forwarder calls, and the relay's own distribution.
+    fn credited_to_fee_recipient(
+        &self,
+        block: &RecoveredBlock<<E::Primitives as NodePrimitives>::Block>,
+        output: &BlockExecutionOutput<<E::Primitives as NodePrimitives>::Receipt>,
+        fee_recipient: Address,
+    ) -> U256 {
+        let paid_via_forwarder = |to: Address, input: &[u8]| {
+            PAYMENT_FORWARDERS.get(&to).is_some_and(|code_hash| {
+                payment_forwarder_recipient(input) == Some(fee_recipient) &&
+                    self.provider.latest().and_then(|state| state.basic_account(&to)).is_ok_and(
+                        |account| {
+                            account.is_some_and(|account| account.bytecode_hash == Some(*code_hash))
+                        },
+                    )
+            })
+        };
+
+        block
+            .body()
+            .transactions()
+            .iter()
+            .zip(block.senders_iter())
+            .zip(output.receipts.iter())
+            .filter(|((_, sender), receipt)| receipt.status() && **sender != fee_recipient)
+            .map(|((tx, sender), receipt)| {
+                let Some(to) = tx.to() else {
+                    return U256::ZERO;
+                };
+
+                if (to == fee_recipient && tx.input().is_empty()) ||
+                    paid_via_forwarder(to, tx.input())
+                {
+                    return tx.value();
+                }
+
+                if (*MERGE_RELAY_SIGNER).is_some_and(|relay_signer| *sender == relay_signer) &&
+                    safe_execution_succeeded(receipt.logs(), to)
+                {
+                    return distribution_value_to(tx.input(), fee_recipient).unwrap_or(U256::ZERO);
+                }
+
+                U256::ZERO
+            })
+            .fold(U256::ZERO, U256::saturating_add)
     }
 
     /// Validates the given [`BlobsBundleV1`] and returns versioned hashes for blobs.
@@ -455,6 +705,7 @@ where
             block,
             request.request.message,
             request.registered_gas_limit,
+            request.transaction_filter,
             None,
         )
         .await
@@ -484,6 +735,7 @@ where
             block,
             request.request.message,
             request.registered_gas_limit,
+            request.transaction_filter,
             None,
         )
         .await
@@ -529,6 +781,7 @@ where
             block,
             request.request.message,
             request.registered_gas_limit,
+            request.transaction_filter,
             None,
         )
         .await
@@ -577,6 +830,7 @@ where
             block,
             request.request.message,
             request.registered_gas_limit,
+            request.transaction_filter,
             Some(decoded_bal),
         )
         .await
@@ -661,8 +915,8 @@ pub struct ValidationApiInner<Provider, E: ConfigureEvm, T: PayloadTypes> {
         Arc<dyn PayloadValidator<T, Block = <E::Primitives as NodePrimitives>::Block>>,
     /// Block executor factory.
     evm_config: E,
-    /// Set of disallowed addresses
-    disallow: AddressSet,
+    /// Disallowed addresses, swappable so a periodic refresh can update them without a restart.
+    disallow: parking_lot::RwLock<Arc<AddressSet>>,
     /// The maximum block distance - parent to latest - allowed for validation
     validation_window: u64,
     /// Cached state reads to avoid redundant disk I/O across multiple validation attempts
@@ -713,6 +967,40 @@ fn validate_message_against_payload(
     }
 }
 
+/// A [`Database`] that records every account read through it, including reads that an inner
+/// cache serves without touching the underlying database.
+#[derive(Debug)]
+struct AccountRecordingDb<'a, DB> {
+    db: DB,
+    accounts: &'a mut AddressSet,
+}
+
+impl<DB: Database> Database for AccountRecordingDb<'_, DB> {
+    type Error = DB::Error;
+
+    fn is_fatal(error: &Self::Error) -> bool {
+        DB::is_fatal(error)
+    }
+
+    fn get_account(&mut self, address: &Address) -> Result<Option<AccountInfo>, Self::Error> {
+        self.accounts.insert(*address);
+        self.db.get_account(address)
+    }
+
+    fn get_code_by_hash(&mut self, code_hash: &B256) -> Result<Bytecode, Self::Error> {
+        self.db.get_code_by_hash(code_hash)
+    }
+
+    fn get_storage(&mut self, address: &Address, index: &Word) -> Result<Word, Self::Error> {
+        self.accounts.insert(*address);
+        self.db.get_storage(address, index)
+    }
+
+    fn get_block_hash(&mut self, number: &Word) -> Result<B256, Self::Error> {
+        self.db.get_block_hash(number)
+    }
+}
+
 /// Calculates a deterministic hash of the blocklist for change detection.
 ///
 /// This function sorts addresses to ensure deterministic output regardless of
@@ -727,6 +1015,15 @@ fn hash_disallow_list(disallow: &AddressSet) -> String {
     }
 
     format!("{:x}", hasher.finalize())
+}
+
+/// Sets the disallow-list size and hash gauges from the given set.
+fn record_disallow_metrics(metrics: &ValidationMetrics, disallow: &AddressSet) {
+    metrics.disallow_size.set(disallow.len() as f64);
+
+    let disallow_hash = hash_disallow_list(disallow);
+    let hash_gauge = gauge!("builder_validation_disallow_hash", "hash" => disallow_hash);
+    hash_gauge.set(1.0);
 }
 
 impl<Provider, E: ConfigureEvm, T: PayloadTypes> fmt::Debug for ValidationApiInner<Provider, E, T> {
@@ -839,26 +1136,47 @@ pub(crate) struct ValidationMetrics {
 #[cfg(test)]
 mod tests {
     use super::{
-        hash_disallow_list, validate_message_against_payload, AddressSet, ValidationApi,
-        ValidationApiConfig, ValidationApiError,
+        distribution_value_to, hash_disallow_list, parse_payment_forwarders,
+        payment_forwarder_recipient, validate_message_against_payload, AddressSet,
+        BuilderBlockValidationRequestV6, CachedReads, TransactionFilter, ValidationApi,
+        ValidationApiConfig, ValidationApiError, DEFAULT_PAYMENT_FORWARDERS, PAYMENT_FORWARDERS,
+        PAYMENT_FORWARDER_CALLDATA_LEN, SAFE_EXECUTION_SUCCESS_TOPIC,
     };
-    use alloy_consensus::{BlockHeader, Header};
-    use alloy_primitives::{Address, B256, U256};
-    use alloy_rpc_types_beacon::relay::BidTrace;
-    use alloy_rpc_types_engine::{ExecutionData, ExecutionPayload, ExecutionPayloadV1};
+    use alloy_consensus::{BlockHeader, Header, TxEip1559};
+    use alloy_eips::{
+        eip7002::WithdrawalRequest,
+        eip8282::{BuilderDepositRequest, BuilderExitRequest},
+    };
+    use alloy_primitives::{
+        address, b256, hex, keccak256, Address, Bytes, FixedBytes, TxKind, B256, U256,
+    };
+    use alloy_rpc_types_beacon::{
+        relay::{BidTrace, SignedBidSubmissionV6},
+        requests::ExecutionRequestsV5,
+    };
+    use alloy_rpc_types_engine::{
+        ExecutionData, ExecutionPayload, ExecutionPayloadV1, ExecutionPayloadV2,
+        ExecutionPayloadV3, ExecutionPayloadV4,
+    };
     use evm2::evm::AccountInfo;
+    use reth_chainspec::ChainSpecBuilder;
     use reth_consensus::noop::NoopConsensus;
     use reth_engine_primitives::PayloadValidator;
     use reth_ethereum_engine_primitives::EthPayloadTypes;
-    use reth_ethereum_primitives::Block;
+    use reth_ethereum_primitives::{Block, BlockBody, Transaction};
+    use reth_evm::{database::StateProviderDatabase, execute::Executor, ConfigureEvm};
     use reth_evm_ethereum::EthEvmConfig;
     use reth_execution_types::BlockExecutionOutput;
     use reth_payload_primitives::NewPayloadError;
-    use reth_primitives_traits::{RecoveredBlock, SealedBlock, SealedHeader};
-    use reth_provider::test_utils::MockEthProvider;
+    use reth_primitives_traits::{
+        crypto::secp256k1::public_key_to_address, RecoveredBlock, SealedBlock, SealedHeader,
+    };
+    use reth_provider::test_utils::{ExtendedAccount, MockEthProvider};
+    use reth_storage_api::StateProviderFactory;
     use reth_tasks::Runtime;
+    use reth_testing_utils::generators;
     use reth_trie_common::bundle_state::{AccountStatus, BundleAccount, BundleState};
-    use std::sync::Arc;
+    use std::{collections::HashMap, sync::Arc};
 
     fn test_execution_payload() -> ExecutionPayload {
         ExecutionPayload::V1(ExecutionPayloadV1 {
@@ -944,6 +1262,593 @@ mod tests {
         };
         assert_eq!(mismatch.got, message.gas_used);
         assert_eq!(mismatch.expected, payload.as_v1().gas_used);
+    }
+
+    fn test_v6_request() -> BuilderBlockValidationRequestV6 {
+        let ExecutionPayload::V1(payload_v1) = test_execution_payload() else { unreachable!() };
+
+        BuilderBlockValidationRequestV6 {
+            request: SignedBidSubmissionV6 {
+                message: BidTrace::default(),
+                execution_payload: ExecutionPayloadV4 {
+                    payload_inner: ExecutionPayloadV3 {
+                        payload_inner: ExecutionPayloadV2 {
+                            payload_inner: payload_v1,
+                            withdrawals: Vec::new(),
+                        },
+                        blob_gas_used: 0,
+                        excess_blob_gas: 0,
+                    },
+                    block_access_list: Bytes::from_static(&[0xaa, 0xbb]),
+                    slot_number: 6,
+                },
+                blobs_bundle: Default::default(),
+                execution_requests: ExecutionRequestsV5::default(),
+                signature: Default::default(),
+            },
+            registered_gas_limit: 30_000_000,
+            parent_beacon_block_root: B256::ZERO,
+            transaction_filter: TransactionFilter::None,
+        }
+    }
+
+    /// EIP-8282 builder deposit requests observed on glamsterdam devnet-8 (relay registry
+    /// topups), reconstructed from the builder deposit predeploy logs of the named blocks.
+    /// The expected hashes are the blocks' on-chain `requestsHash` header fields, so this
+    /// proves the typed representation reproduces the EIP-7685 commitment for real gloas-era
+    /// blocks carrying builder requests.
+    #[test]
+    fn test_devnet8_builder_deposit_requests_hash() {
+        let pubkey = FixedBytes::from(hex!(
+            "a44d606ec070d7252f1fdbff753ae5913615f0d323b93dd403ad99d2706b4bcfd96d258a4327538acb6282e1ae7397ed"
+        ));
+        let withdrawal_credentials =
+            b256!("b00000000000000000000000a4449f1cfb6476994842c346fad9ec7cd15380bd");
+
+        let cases = [
+            // block 210258
+            (
+                91_000_000_000u64,
+                hex!(
+                    "95a3bb94fbf447868213462857b574bb840f4299b4e603c3016f9a86b23086395d43d13be362c1e9179c82d28415e0eb044300f5f2d1c90ddf446eea31e279de0c9d3163a7fef26742e4c0952a03306319d2a87bd0cbd7c1100ca0e6ee5e747a"
+                ),
+                b256!("1c85a255985080d1ee0ae90ed6e4825ab75e64b316783684ea83c1d9709cf6af"),
+            ),
+            // block 216118
+            (
+                500_000_000_000u64,
+                hex!(
+                    "ae171b037a065264d90d2eee298f54a2e13465b18b171457fc4e2714fd8b687415c8eae08e4750f0829a03277523ff730a1198df2b4272062fafaa024f7a106794f21534754919f0ea8f3811dec78d951198da3badf9f853563b46cf2c83b6a3"
+                ),
+                b256!("79b08a123c1a895a75b0dd2edf13667ff1a71c442baa729040363a408afa1b15"),
+            ),
+        ];
+
+        for (amount, signature, expected_requests_hash) in cases {
+            let requests = ExecutionRequestsV5 {
+                builder_deposits: vec![BuilderDepositRequest {
+                    pubkey,
+                    withdrawal_credentials,
+                    amount,
+                    signature: FixedBytes::from(signature),
+                }],
+                ..Default::default()
+            };
+
+            assert_eq!(requests.to_requests().requests_hash(), expected_requests_hash);
+        }
+    }
+
+    /// Builder pubkey of the relay's devnet-8 registry entry, reused by the builder-exit cases
+    /// below so they exercise realistically shaped (not repeat-byte) inputs.
+    fn devnet8_builder_pubkey() -> FixedBytes<48> {
+        FixedBytes::from(hex!(
+            "a44d606ec070d7252f1fdbff753ae5913615f0d323b93dd403ad99d2706b4bcfd96d258a4327538acb6282e1ae7397ed"
+        ))
+    }
+
+    /// Withdrawal address embedded in the relay's `0xb0…` builder withdrawal credentials, which
+    /// is also the address that would submit a builder exit for that entry.
+    fn devnet8_builder_source_address() -> Address {
+        address!("0xa4449f1cfb6476994842c346fad9ec7cd15380bd")
+    }
+
+    fn devnet8_builder_deposits() -> Vec<BuilderDepositRequest> {
+        let withdrawal_credentials =
+            b256!("b00000000000000000000000a4449f1cfb6476994842c346fad9ec7cd15380bd");
+
+        vec![
+            BuilderDepositRequest {
+                pubkey: devnet8_builder_pubkey(),
+                withdrawal_credentials,
+                amount: 91_000_000_000,
+                signature: FixedBytes::from(hex!(
+                    "95a3bb94fbf447868213462857b574bb840f4299b4e603c3016f9a86b23086395d43d13be362c1e9179c82d28415e0eb044300f5f2d1c90ddf446eea31e279de0c9d3163a7fef26742e4c0952a03306319d2a87bd0cbd7c1100ca0e6ee5e747a"
+                )),
+            },
+            BuilderDepositRequest {
+                pubkey: FixedBytes::repeat_byte(0xb0),
+                withdrawal_credentials,
+                amount: 500_000_000_000,
+                signature: FixedBytes::from(hex!(
+                    "ae171b037a065264d90d2eee298f54a2e13465b18b171457fc4e2714fd8b687415c8eae08e4750f0829a03277523ff730a1198df2b4272062fafaa024f7a106794f21534754919f0ea8f3811dec78d951198da3badf9f853563b46cf2c83b6a3"
+                )),
+            },
+        ]
+    }
+
+    /// No devnet block has carried a builder exit (`0x04`) yet, so the expected commitments here
+    /// come from an independent reimplementation of the EIP-7685 hash (SSZ fixed-size container
+    /// concatenation, then `sha256(concat(sha256(type || data)))` over non-empty requests only)
+    /// that was first checked against the two real on-chain hashes asserted in
+    /// [`test_devnet8_builder_deposit_requests_hash`]. Exercising exits this way still pins the
+    /// `0x04` type byte, the 68-byte `source_address ++ pubkey` layout and the list ordering.
+    #[test]
+    fn test_builder_exit_requests_hash() {
+        let requests = ExecutionRequestsV5 {
+            builder_exits: vec![BuilderExitRequest {
+                source_address: devnet8_builder_source_address(),
+                pubkey: devnet8_builder_pubkey(),
+            }],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            requests.to_requests().requests_hash(),
+            b256!("f9799dae8c2b40782f525d1d7bd54da6a31515e6f056945153513f660b8009ca")
+        );
+    }
+
+    /// A block carrying Electra and gloas request types together: the `0x03`/`0x04` builder
+    /// requests must be committed alongside the Electra ones, in ascending type order, without
+    /// disturbing them.
+    #[test]
+    fn test_mixed_electra_and_builder_requests_hash() {
+        let withdrawals = vec![WithdrawalRequest {
+            source_address: devnet8_builder_source_address(),
+            validator_pubkey: devnet8_builder_pubkey(),
+            amount: 0,
+        }];
+        let builder_exits = vec![
+            BuilderExitRequest {
+                source_address: devnet8_builder_source_address(),
+                pubkey: devnet8_builder_pubkey(),
+            },
+            BuilderExitRequest {
+                source_address: devnet8_builder_source_address(),
+                pubkey: FixedBytes::repeat_byte(0xb0),
+            },
+        ];
+
+        let requests = ExecutionRequestsV5 {
+            withdrawals: withdrawals.clone(),
+            builder_deposits: devnet8_builder_deposits(),
+            builder_exits: builder_exits.clone(),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            requests.to_requests().requests_hash(),
+            b256!("0ea2b4ddd21d4cbca90bb0391e65120cab2d5b5fd093e84357362bdab9df2fe5")
+        );
+
+        // Request order inside a list is committed to, so a reordered exit list must not
+        // reproduce the same commitment.
+        let reordered = ExecutionRequestsV5 {
+            withdrawals,
+            builder_deposits: devnet8_builder_deposits(),
+            builder_exits: builder_exits.into_iter().rev().collect(),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            reordered.to_requests().requests_hash(),
+            b256!("7a80e960aba502bd450ee7381cd5bf42a178b6098beb54ed9a1e95cce5a9d2b2")
+        );
+    }
+
+    /// The `execution_requests` object on the RPC body is the surface a relay actually posts, so
+    /// the builder lists must survive JSON as well as SSZ -- and an Electra-shaped body (no
+    /// builder keys at all) must still parse, which is what keeps V6 callers working.
+    #[test]
+    fn test_v6_body_carries_builder_requests_over_json() {
+        let mut request = test_v6_request();
+        request.request.execution_requests = ExecutionRequestsV5 {
+            builder_deposits: devnet8_builder_deposits(),
+            builder_exits: vec![BuilderExitRequest {
+                source_address: devnet8_builder_source_address(),
+                pubkey: devnet8_builder_pubkey(),
+            }],
+            ..Default::default()
+        };
+
+        let json = serde_json::to_value(&request).unwrap();
+
+        assert_eq!(json["execution_requests"]["builder_deposits"].as_array().unwrap().len(), 2);
+        assert_eq!(json["execution_requests"]["builder_exits"].as_array().unwrap().len(), 1);
+
+        let parsed: BuilderBlockValidationRequestV6 = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(parsed, request);
+
+        let mut electra_shaped = json;
+        electra_shaped["execution_requests"] =
+            serde_json::json!({ "deposits": [], "withdrawals": [], "consolidations": [] });
+
+        let parsed: BuilderBlockValidationRequestV6 =
+            serde_json::from_value(electra_shaped).unwrap();
+        assert!(parsed.request.execution_requests.builder_deposits.is_empty());
+        assert!(parsed.request.execution_requests.builder_exits.is_empty());
+    }
+
+    /// The opaque EIP-7685 wire form a relay forwards is what the node decodes back into typed
+    /// requests, so a mixed gloas block must survive that round trip unchanged.
+    #[test]
+    fn test_mixed_builder_requests_round_trip_through_wire_form() {
+        let requests = ExecutionRequestsV5 {
+            builder_deposits: devnet8_builder_deposits(),
+            builder_exits: vec![BuilderExitRequest {
+                source_address: devnet8_builder_source_address(),
+                pubkey: devnet8_builder_pubkey(),
+            }],
+            ..Default::default()
+        };
+
+        let decoded = ExecutionRequestsV5::try_from(&requests.to_requests()).unwrap();
+
+        assert_eq!(decoded, requests);
+    }
+
+    /// 4-byte big-endian timestamp followed by the 20-byte recipient.
+    fn forwarder_calldata(recipient: Address, timestamp: u32) -> Vec<u8> {
+        let mut input = timestamp.to_be_bytes().to_vec();
+        input.extend_from_slice(recipient.as_slice());
+        input
+    }
+
+    /// Distribution transactions from merged blocks we delivered to mainnet, as
+    /// `(block number, proposer leg, proposer fee recipient, calldata)`.
+    ///
+    /// The leg is `proposer_value - original_value` as recorded in `merged_block`, so these pin the
+    /// decoder to calldata the relay actually produced.
+    const DELIVERED_DISTRIBUTIONS: [(u64, u64, Address, &str); 3] = [
+        (25953192, 23845723176864, address!("0x8696e84ab5e78983f2456bcb5c199eea9648c8c2"), "0x6a7612020000000000000000000000009641d764fc13c8b624c04430c7356c1c7c8102e2000000000000000000000000000000000000000000000000000041100b93fee0000000000000000000000000000000000000000000000000000000000000014000000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000819eb0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000002c000000000000000000000000000000000000000000000000000000000000001448d80ff0a000000000000000000000000000000000000000000000000000000000000002000000000000000000000000000000000000000000000000000000000000000ff004838b106fce9647bdf1e7877bf73ce8b0bad5f97000000000000000000000000000000000000000000000000000015b003dbffa00000000000000000000000000000000000000000000000000000000000000000008696e84ab5e78983f2456bcb5c199eea9648c8c2000000000000000000000000000000000000000000000000000015b003dbffa00000000000000000000000000000000000000000000000000000000000000000002b3604ded748e848176c045ec701bcf70176b618000000000000000000000000000000000000000000000000000015b003dbffa0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000041ef0e0ff7a017a109d2afe4b3722b26cff9b8ae88d72747e64dfb25a7d4266c353f21a3c5da7650920390990857c86906ec1da7349a064d0a99350bee0a2343231c00000000000000000000000000000000000000000000000000000000000000"),
+        (25953197, 19344068569468, address!("0x388c818ca8b9251b393131c08a736a67ccb19297"), "0x6a7612020000000000000000000000009641d764fc13c8b624c04430c7356c1c7c8102e2000000000000000000000000000000000000000000000000000034c7ad01bc74000000000000000000000000000000000000000000000000000000000000014000000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000cccccc000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000002c000000000000000000000000000000000000000000000000000000000000001448d80ff0a000000000000000000000000000000000000000000000000000000000000002000000000000000000000000000000000000000000000000000000000000000ff002b3604ded748e848176c045ec701bcf70176b61800000000000000000000000000000000000000000000000000001197e455e97c0000000000000000000000000000000000000000000000000000000000000000004838b106fce9647bdf1e7877bf73ce8b0bad5f9700000000000000000000000000000000000000000000000000001197e455e97c000000000000000000000000000000000000000000000000000000000000000000388c818ca8b9251b393131c08a736a67ccb1929700000000000000000000000000000000000000000000000000001197e455e97c0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000417cda46b781c7afecc03786e5c1465545854c5dc07274f35410164278b40a49f2220637705d9109f77ee5bfa0e9c75dcc82238cbb0a372cb9bee12c8f2fbe27451b00000000000000000000000000000000000000000000000000000000000000"),
+        (25953198, 2638279283548, address!("0xcc20850f1907be2aab7474b9819112e37e630d7b"), "0x6a7612020000000000000000000000009641d764fc13c8b624c04430c7356c1c7c8102e200000000000000000000000000000000000000000000000000000732d1193a14000000000000000000000000000000000000000000000000000000000000014000000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000cccccc000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000002c000000000000000000000000000000000000000000000000000000000000001448d80ff0a000000000000000000000000000000000000000000000000000000000000002000000000000000000000000000000000000000000000000000000000000000ff004838b106fce9647bdf1e7877bf73ce8b0bad5f970000000000000000000000000000000000000000000000000000026645b3135c000000000000000000000000000000000000000000000000000000000000000000cc20850f1907be2aab7474b9819112e37e630d7b0000000000000000000000000000000000000000000000000000026645b3135c0000000000000000000000000000000000000000000000000000000000000000002b3604ded748e848176c045ec701bcf70176b6180000000000000000000000000000000000000000000000000000026645b3135c000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000041155b1c3bb73f3b97c524ef4672208553221b24b5c9ffdcee7fc374722e9d45b14e91960c5602d6827584f8a4eb26dc6abddd73b430e91c71642f25ff711596da1b00000000000000000000000000000000000000000000000000000000000000"),
+    ];
+
+    #[test]
+    fn distribution_value_to_reads_delivered_merged_blocks() {
+        for (block_number, proposer_leg, fee_recipient, calldata) in DELIVERED_DISTRIBUTIONS {
+            let calldata = alloy_primitives::hex::decode(calldata).unwrap();
+
+            assert_eq!(
+                distribution_value_to(&calldata, fee_recipient),
+                Some(U256::from(proposer_leg)),
+                "block {block_number}"
+            );
+        }
+    }
+
+    /// The relay signs the same distribution to the base builder and to itself, so a recipient that
+    /// was not part of it has to read as nothing rather than as somebody else's leg.
+    #[test]
+    fn distribution_value_to_is_zero_for_a_bystander_of_a_delivered_block() {
+        let (block_number, _, _, calldata) = DELIVERED_DISTRIBUTIONS[0];
+        let calldata = alloy_primitives::hex::decode(calldata).unwrap();
+
+        assert_eq!(
+            distribution_value_to(&calldata, Address::from([0xAB; 20])),
+            Some(U256::ZERO),
+            "block {block_number}"
+        );
+    }
+
+    #[test]
+    fn safe_execution_success_topic_matches_the_event_signature() {
+        assert_eq!(SAFE_EXECUTION_SUCCESS_TOPIC, keccak256("ExecutionSuccess(bytes32,uint256)"));
+    }
+
+    /// The runtime deployed at `DEFAULT_PAYMENT_FORWARDERS[0]`, whose hash the entry pins.
+    const PAYMENT_FORWARDER_RUNTIME: [u8; 20] = hex!("5f358060e01c4218600f5760401cff5b5f5ffd00");
+
+    /// The contract reverts unless the calldata repeats the block timestamp, so the fixture and
+    /// its calldata have to agree on one.
+    const FORWARDER_BLOCK_TIMESTAMP: u64 = 1_786_450_919;
+
+    /// Drives `ensure_payment` over a one-transaction block that pays `call_to` the bid value,
+    /// with `runtime` deployed at `deployed_at` and the calldata built from the block's proposer
+    /// fee recipient.
+    ///
+    /// The sender is also the fee recipient, so its gas spend puts the balance delta below the
+    /// bid and validation falls through to the last-transaction path the forwarder rules live
+    /// on. Returns whether the payment transaction itself succeeded alongside the outcome, so a
+    /// rejection can be attributed to those rules rather than to a revert.
+    fn ensure_payment_over_a_forwarder_call(
+        deployed_at: Address,
+        runtime: &[u8],
+        call_to: Address,
+        calldata: impl FnOnce(Address) -> Vec<u8>,
+    ) -> (bool, Result<(), ValidationApiError>) {
+        let value = U256::from(8_594_702_506_957_281u64);
+        let base_fee: u64 = 7;
+
+        let chain_spec = Arc::new(ChainSpecBuilder::mainnet().cancun_activated().build());
+
+        let mut rng = generators::rng();
+        let key = generators::generate_key(&mut rng);
+        let fee_recipient = public_key_to_address(key.public_key());
+
+        let provider = MockEthProvider::default().with_chain_spec((*chain_spec).clone());
+        provider.add_account(
+            fee_recipient,
+            ExtendedAccount::new(0, U256::from(10).pow(U256::from(18))),
+        );
+        provider.add_account(
+            deployed_at,
+            ExtendedAccount::new(1, U256::ZERO).with_bytecode(runtime.to_vec().into()),
+        );
+
+        let tx = generators::sign_tx_with_key_pair(
+            key,
+            Transaction::Eip1559(TxEip1559 {
+                chain_id: chain_spec.chain.id(),
+                nonce: 0,
+                gas_limit: 100_000,
+                max_fee_per_gas: base_fee as u128,
+                max_priority_fee_per_gas: 0,
+                to: TxKind::Call(call_to),
+                value,
+                input: calldata(fee_recipient).into(),
+                ..Default::default()
+            }),
+        );
+
+        let header = Header {
+            timestamp: FORWARDER_BLOCK_TIMESTAMP,
+            base_fee_per_gas: Some(base_fee),
+            gas_limit: 30_000_000,
+            parent_beacon_block_root: Some(B256::ZERO),
+            excess_blob_gas: Some(0),
+            blob_gas_used: Some(0),
+            ..Default::default()
+        };
+        let block = RecoveredBlock::new_unhashed(
+            Block { header, body: BlockBody { transactions: vec![tx], ..Default::default() } },
+            vec![fee_recipient],
+        );
+
+        let evm_config = EthEvmConfig::new(chain_spec);
+        let output = evm_config
+            .batch_executor(StateProviderDatabase::new(reth_storage_api::EvmStateProviderAdapter(
+                provider.latest().unwrap(),
+            )))
+            .execute(&block)
+            .unwrap();
+        let executed = output.receipts.last().unwrap().success;
+
+        let message =
+            BidTrace { proposer_fee_recipient: fee_recipient, value, ..Default::default() };
+
+        let api: ValidationApi<_, _, EthPayloadTypes> = ValidationApi::new(
+            provider,
+            NoopConsensus::arc(),
+            evm_config,
+            ValidationApiConfig::default(),
+            Runtime::test(),
+            Arc::new(UnusedPayloadValidator),
+            None,
+        );
+
+        (executed, api.ensure_payment(&block, &output, &message))
+    }
+
+    /// Reproduces the mainnet failure at slot 14968908 end to end: a correct forwarder payment,
+    /// actually executed, where the fee recipient's own spending makes the balance-delta
+    /// shortcut miss. `ensure_payment` must accept it on the last-transaction path.
+    #[test]
+    fn ensure_payment_accepts_an_executed_forwarder_payment() {
+        let (forwarder, _) = DEFAULT_PAYMENT_FORWARDERS[0];
+
+        let (executed, outcome) = ensure_payment_over_a_forwarder_call(
+            forwarder,
+            &PAYMENT_FORWARDER_RUNTIME,
+            forwarder,
+            |fee_recipient| forwarder_calldata(fee_recipient, FORWARDER_BLOCK_TIMESTAMP as u32),
+        );
+
+        assert!(executed, "the payment executed");
+        assert!(outcome.is_ok(), "a correct forwarder payment must validate: {outcome:?}");
+    }
+
+    /// The listed address is half the entry: the very same contract, byte for byte, deployed
+    /// somewhere unlisted must not be trusted to have forwarded anything. Without this an
+    /// attacker only has to redeploy the runtime to mint accepted payments.
+    #[test]
+    fn ensure_payment_rejects_a_forwarder_payment_to_an_unlisted_address() {
+        let unlisted = Address::repeat_byte(0x42);
+        assert!(!PAYMENT_FORWARDERS.contains_key(&unlisted));
+
+        let (executed, outcome) = ensure_payment_over_a_forwarder_call(
+            unlisted,
+            &PAYMENT_FORWARDER_RUNTIME,
+            unlisted,
+            |fee_recipient| forwarder_calldata(fee_recipient, FORWARDER_BLOCK_TIMESTAMP as u32),
+        );
+
+        assert!(executed, "the forwarder ran, it is only unlisted");
+        assert!(
+            matches!(outcome, Err(ValidationApiError::ProposerPayment)),
+            "unexpected outcome: {outcome:?}"
+        );
+    }
+
+    /// The code hash is the other half: a listed address carrying anything but its own runtime
+    /// must be rejected. A value call to a contract that forwards nothing still succeeds and
+    /// keeps the value, so the address alone would validate a payment the proposer never got.
+    #[test]
+    fn ensure_payment_rejects_a_listed_forwarder_carrying_other_code() {
+        let (forwarder, code_hash) = DEFAULT_PAYMENT_FORWARDERS[0];
+        let other_runtime = hex!("00");
+        assert_ne!(keccak256(other_runtime), code_hash);
+
+        let (executed, outcome) = ensure_payment_over_a_forwarder_call(
+            forwarder,
+            &other_runtime,
+            forwarder,
+            |fee_recipient| forwarder_calldata(fee_recipient, FORWARDER_BLOCK_TIMESTAMP as u32),
+        );
+
+        assert!(executed, "the call succeeds, the value simply stays put");
+        assert!(
+            matches!(outcome, Err(ValidationApiError::ProposerPayment)),
+            "unexpected outcome: {outcome:?}"
+        );
+    }
+
+    /// The forwarder pays whoever the calldata names, which need not be the proposer.
+    #[test]
+    fn ensure_payment_rejects_a_forwarder_payment_naming_another_recipient() {
+        let (forwarder, _) = DEFAULT_PAYMENT_FORWARDERS[0];
+        let someone_else = Address::repeat_byte(0x99);
+
+        let (executed, outcome) = ensure_payment_over_a_forwarder_call(
+            forwarder,
+            &PAYMENT_FORWARDER_RUNTIME,
+            forwarder,
+            |_| forwarder_calldata(someone_else, FORWARDER_BLOCK_TIMESTAMP as u32),
+        );
+
+        assert!(executed, "the forwarder paid, just not the proposer");
+        assert!(
+            matches!(outcome, Err(ValidationApiError::ProposerPayment)),
+            "unexpected outcome: {outcome:?}"
+        );
+    }
+
+    /// Short calldata zero-pads the recipient, so the contract forwards the value to an address
+    /// nobody chose. Every truncation has to be rejected, whether the call reverts or succeeds.
+    #[test]
+    fn ensure_payment_rejects_a_forwarder_payment_with_short_calldata() {
+        let (forwarder, _) = DEFAULT_PAYMENT_FORWARDERS[0];
+
+        for len in 0..PAYMENT_FORWARDER_CALLDATA_LEN {
+            let (_, outcome) = ensure_payment_over_a_forwarder_call(
+                forwarder,
+                &PAYMENT_FORWARDER_RUNTIME,
+                forwarder,
+                |fee_recipient| {
+                    let mut input =
+                        forwarder_calldata(fee_recipient, FORWARDER_BLOCK_TIMESTAMP as u32);
+                    input.truncate(len);
+                    input
+                },
+            );
+
+            assert!(
+                matches!(outcome, Err(ValidationApiError::ProposerPayment)),
+                "accepted {len} bytes: {outcome:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn payment_forwarders_default_to_the_canonical_deployment() {
+        let expected: HashMap<Address, B256> = DEFAULT_PAYMENT_FORWARDERS.into_iter().collect();
+
+        assert_eq!(*PAYMENT_FORWARDERS, expected);
+    }
+
+    /// If this stops matching, the contract changed and its address changed with it.
+    #[test]
+    fn payment_forwarder_code_hash_matches_the_deployed_runtime() {
+        let (_, code_hash) = DEFAULT_PAYMENT_FORWARDERS[0];
+
+        assert_eq!(keccak256(PAYMENT_FORWARDER_RUNTIME), code_hash);
+    }
+
+    /// The migration case: both deployments accepted at once, each pinned to its own code hash.
+    #[test]
+    fn parse_payment_forwarders_reads_several_pairs() {
+        let old = Address::from([1u8; 20]);
+        let new = Address::from([2u8; 20]);
+        let old_hash = B256::from([3u8; 32]);
+        let new_hash = B256::from([4u8; 32]);
+
+        let parsed =
+            parse_payment_forwarders(&format!(" {old}:{old_hash} , {new}:{new_hash} ")).unwrap();
+
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed.get(&old), Some(&old_hash));
+        assert_eq!(parsed.get(&new), Some(&new_hash));
+    }
+
+    /// A typo must not silently parse to a list that accepts nothing - that would demote every
+    /// builder paying through a forwarder.
+    #[test]
+    fn parse_payment_forwarders_rejects_malformed_input() {
+        let address = Address::from([1u8; 20]);
+        let hash = B256::from([3u8; 32]);
+
+        for input in [
+            String::new(),
+            "  ,  ".to_string(),
+            format!("{address}"),
+            format!("{address}:"),
+            format!(":{hash}"),
+            format!("{address}:0xnothex"),
+            format!("notanaddress:{hash}"),
+        ] {
+            assert!(parse_payment_forwarders(&input).is_err(), "accepted `{input}`");
+        }
+    }
+
+    #[test]
+    fn payment_forwarder_recipient_reads_the_encoded_address() {
+        let recipient = Address::from([7u8; 20]);
+        let input = forwarder_calldata(recipient, 1_760_000_000);
+
+        assert_eq!(input.len(), PAYMENT_FORWARDER_CALLDATA_LEN);
+        assert_eq!(payment_forwarder_recipient(&input), Some(recipient));
+    }
+
+    #[test]
+    fn payment_forwarder_recipient_rejects_short_calldata() {
+        let recipient = Address::from([7u8; 20]);
+
+        for len in 0..PAYMENT_FORWARDER_CALLDATA_LEN {
+            let mut input = forwarder_calldata(recipient, 1_760_000_000);
+            input.truncate(len);
+
+            assert_eq!(payment_forwarder_recipient(&input), None, "accepted {len} bytes");
+        }
+    }
+
+    #[test]
+    fn payment_forwarder_recipient_ignores_trailing_calldata() {
+        let recipient = Address::from([7u8; 20]);
+
+        for extra in 1..=64usize {
+            let mut input = forwarder_calldata(recipient, 1_760_000_000);
+            input.extend(std::iter::repeat_n(0xABu8, extra));
+
+            assert_eq!(
+                payment_forwarder_recipient(&input),
+                Some(recipient),
+                "misparsed with {extra} trailing bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn payment_forwarder_recipient_ignores_the_timestamp_value() {
+        let recipient = Address::from([7u8; 20]);
+
+        for timestamp in [0u32, 1, 1_760_000_000, u32::MAX] {
+            assert_eq!(
+                payment_forwarder_recipient(&forwarder_calldata(recipient, timestamp)),
+                Some(recipient)
+            );
+        }
     }
 
     #[test]
@@ -1058,15 +1963,256 @@ mod tests {
     fn test_validation_api(
         provider: MockEthProvider,
     ) -> ValidationApi<MockEthProvider, EthEvmConfig, EthPayloadTypes> {
+        test_validation_api_with_disallow(provider, AddressSet::default())
+    }
+
+    fn test_validation_api_with_disallow(
+        provider: MockEthProvider,
+        disallow: AddressSet,
+    ) -> ValidationApi<MockEthProvider, EthEvmConfig, EthPayloadTypes> {
         ValidationApi::new(
             provider,
             NoopConsensus::arc(),
             EthEvmConfig::mainnet(),
-            ValidationApiConfig::default(),
+            ValidationApiConfig { disallow, ..Default::default() },
             Runtime::test(),
             Arc::new(UnusedPayloadValidator),
             None,
         )
+    }
+
+    /// A provider whose parent state holds a contract that reads the balance of `target`, so a
+    /// call to it touches `target` without `target` being a sender or recipient.
+    fn balance_reader_parent(target: Address) -> (MockEthProvider, SealedHeader, Address) {
+        let provider = MockEthProvider::default();
+
+        let parent =
+            SealedHeader::seal_slow(Header { gas_limit: 30_000_000, ..Default::default() });
+        provider.add_block(
+            parent.hash(),
+            Block { header: parent.clone_header(), body: Default::default() },
+        );
+
+        let reader = Address::repeat_byte(0xcc);
+        let code = [&[0x73][..], target.as_slice(), &[0x31, 0x50, 0x00]].concat();
+        provider
+            .add_account(reader, ExtendedAccount::new(0, U256::ZERO).with_bytecode(code.into()));
+
+        (provider, parent, reader)
+    }
+
+    /// A zero-value submission on `parent` with one transaction calling each of `calls`.
+    fn submission_calling(
+        provider: &MockEthProvider,
+        parent: &SealedHeader,
+        calls: &[Address],
+    ) -> (RecoveredBlock<Block>, BidTrace) {
+        submission_calling_in_slot(provider, parent, calls, 1)
+    }
+
+    /// Builds a submission for the slot `slots_after_parent` slots after `parent`, so a value
+    /// above 1 models a slot that follows missed slots.
+    fn submission_calling_in_slot(
+        provider: &MockEthProvider,
+        parent: &SealedHeader,
+        calls: &[Address],
+        slots_after_parent: u64,
+    ) -> (RecoveredBlock<Block>, BidTrace) {
+        let transactions = calls
+            .iter()
+            .enumerate()
+            .map(|(nonce, to)| {
+                reth_ethereum_primitives::TransactionSigned::new_unhashed(
+                    reth_ethereum_primitives::Transaction::Legacy(alloy_consensus::TxLegacy {
+                        nonce: nonce as u64,
+                        gas_limit: 100_000,
+                        to: TxKind::Call(*to),
+                        ..Default::default()
+                    }),
+                    alloy_primitives::Signature::test_signature(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let senders = vec![Address::ZERO; transactions.len()];
+
+        let header = Header {
+            parent_hash: parent.hash(),
+            number: parent.number() + 1,
+            gas_limit: parent.gas_limit(),
+            timestamp: parent.timestamp() + 12 * slots_after_parent,
+            ..Default::default()
+        };
+        let block = RecoveredBlock::new_unhashed(
+            Block { header, body: BlockBody { transactions, ..Default::default() } },
+            senders,
+        );
+
+        provider.state_roots.lock().push(block.state_root());
+
+        let message = BidTrace {
+            slot: slots_after_parent,
+            parent_hash: block.parent_hash(),
+            block_hash: block.hash(),
+            gas_limit: block.gas_limit(),
+            gas_used: block.gas_used(),
+            ..Default::default()
+        };
+
+        (block, message)
+    }
+
+    /// The shared cache serves `blocked` without a database read, so the check has to see reads
+    /// that the cache answers, not only cache misses.
+    #[tokio::test]
+    async fn test_disallowed_account_served_from_the_shared_cache_is_rejected() {
+        let blocked = Address::repeat_byte(0xbb);
+        let (provider, parent, reader) = balance_reader_parent(blocked);
+        let (block, message) = submission_calling(&provider, &parent, &[reader]);
+        let registered_gas_limit = block.gas_limit();
+
+        let api = test_validation_api_with_disallow(provider, AddressSet::from_iter([blocked]));
+
+        let mut shared_cache = CachedReads::default();
+        shared_cache.insert_account(blocked, AccountInfo::default(), Default::default());
+        *api.cached_state.write().await = (parent.hash(), shared_cache);
+
+        let err = api
+            .validate_message_against_block(
+                block,
+                message,
+                registered_gas_limit,
+                TransactionFilter::OFAC,
+                None,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, ValidationApiError::Blacklist(address) if address == blocked),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// An unfiltered submission may touch a disallowed account and still pass, which puts that
+    /// account into the shared cache for the parent. A later filtered submission on the same
+    /// parent that does not touch it must not be rejected for it.
+    #[tokio::test]
+    async fn test_unfiltered_read_does_not_reject_a_later_filtered_submission() {
+        let blocked = Address::repeat_byte(0xbb);
+        let (provider, parent, _) = balance_reader_parent(blocked);
+        // Slot N (unfiltered) is missed, so slot N+1 (filtered) builds on the same parent.
+        let (unfiltered_block, unfiltered_message) =
+            submission_calling_in_slot(&provider, &parent, &[blocked], 1);
+        let (filtered_block, filtered_message) =
+            submission_calling_in_slot(&provider, &parent, &[], 2);
+        let registered_gas_limit = parent.gas_limit();
+
+        let api = test_validation_api_with_disallow(provider, AddressSet::from_iter([blocked]));
+
+        api.validate_message_against_block(
+            unfiltered_block,
+            unfiltered_message,
+            registered_gas_limit,
+            TransactionFilter::None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(api.cached_state.read().await.1.accounts.contains_key(&blocked));
+
+        api.validate_message_against_block(
+            filtered_block,
+            filtered_message,
+            registered_gas_limit,
+            TransactionFilter::OFAC,
+            None,
+        )
+        .await
+        .unwrap();
+    }
+
+    /// Returns the prepared block regardless of the payload, so a V6 request can be driven
+    /// through [`ValidationApi::validate_builder_submission_v6`] without building a payload that
+    /// converts.
+    #[derive(Debug)]
+    struct FixedBlockPayloadValidator(SealedBlock<Block>);
+
+    impl PayloadValidator<EthPayloadTypes> for FixedBlockPayloadValidator {
+        type Block = Block;
+
+        fn convert_payload_to_block(
+            &self,
+            _payload: ExecutionData,
+        ) -> Result<SealedBlock<Self::Block>, NewPayloadError> {
+            Ok(self.0.clone())
+        }
+    }
+
+    /// A V6 submission carrying one transaction, with the sender's address returned so it can be
+    /// put on the disallow list.
+    fn v6_submission_with_one_sender(
+    ) -> (MockEthProvider, BuilderBlockValidationRequestV6, SealedBlock<Block>, Address) {
+        let provider = MockEthProvider::default();
+
+        let parent =
+            SealedHeader::seal_slow(Header { gas_limit: 30_000_000, ..Default::default() });
+        provider.add_block(
+            parent.hash(),
+            Block { header: parent.clone_header(), body: Default::default() },
+        );
+
+        let mut rng = generators::rng();
+        let key = generators::generate_key(&mut rng);
+        let sender = public_key_to_address(key.public_key());
+        let tx = generators::sign_tx_with_key_pair(
+            key,
+            Transaction::Eip1559(TxEip1559 {
+                chain_id: 1,
+                nonce: 0,
+                gas_limit: 21_000,
+                max_fee_per_gas: 0,
+                max_priority_fee_per_gas: 0,
+                to: TxKind::Call(Address::repeat_byte(0x99)),
+                value: U256::ZERO,
+                ..Default::default()
+            }),
+        );
+
+        let header = Header {
+            parent_hash: parent.hash(),
+            number: parent.number() + 1,
+            gas_limit: parent.gas_limit(),
+            timestamp: parent.timestamp() + 12,
+            ..Default::default()
+        };
+        let block = SealedBlock::seal_slow(Block {
+            header,
+            body: BlockBody { transactions: vec![tx], ..Default::default() },
+        });
+
+        let mut request = test_v6_request();
+        request.registered_gas_limit = block.gas_limit();
+        // The V6 handler decodes the block access list before anything else, so it has to be
+        // well-formed RLP; an empty list is enough here.
+        request.request.execution_payload.block_access_list = Bytes::from_static(&[0xc0]);
+
+        let payload = &mut request.request.execution_payload.payload_inner.payload_inner;
+        payload.payload_inner.parent_hash = block.parent_hash();
+        payload.payload_inner.block_hash = block.hash();
+        payload.payload_inner.gas_limit = block.gas_limit();
+        payload.payload_inner.gas_used = block.gas_used();
+
+        request.request.message = BidTrace {
+            parent_hash: block.parent_hash(),
+            block_hash: block.hash(),
+            gas_limit: block.gas_limit(),
+            gas_used: block.gas_used(),
+            ..Default::default()
+        };
+
+        provider.state_roots.lock().push(block.state_root());
+
+        (provider, request, block, sender)
     }
 
     /// A submission whose payload pays the proposer nothing, like a trustless ePBS bid: there the
@@ -1129,7 +2275,13 @@ mod tests {
         );
         message.block_hash = block.hash();
         let error = test_validation_api(provider)
-            .validate_message_against_block(block, message, parent_block.gas_limit(), None)
+            .validate_message_against_block(
+                block,
+                message,
+                parent_block.gas_limit(),
+                TransactionFilter::None,
+                None,
+            )
             .await
             .unwrap_err();
         assert!(
@@ -1149,7 +2301,13 @@ mod tests {
         let registered_gas_limit = block.gas_limit();
 
         let err = test_validation_api(provider)
-            .validate_message_against_block(block, message, registered_gas_limit, None)
+            .validate_message_against_block(
+                block,
+                message,
+                registered_gas_limit,
+                TransactionFilter::None,
+                None,
+            )
             .await
             .unwrap_err();
 
@@ -1163,7 +2321,13 @@ mod tests {
         message.value = U256::ZERO;
 
         test_validation_api(provider)
-            .validate_message_against_block(block, message, registered_gas_limit, None)
+            .validate_message_against_block(
+                block,
+                message,
+                registered_gas_limit,
+                TransactionFilter::None,
+                None,
+            )
             .await
             .unwrap();
     }
@@ -1182,9 +2346,59 @@ mod tests {
             state: fee_recipient_spent(message.proposer_fee_recipient),
         };
 
-        test_validation_api(provider)
-            .ensure_payment(block.sealed_block(), &output, &message)
-            .unwrap();
+        test_validation_api(provider).ensure_payment(&block, &output, &message).unwrap();
+    }
+
+    fn v6_validation_api(
+        provider: MockEthProvider,
+        block: SealedBlock<Block>,
+        disallow: AddressSet,
+    ) -> ValidationApi<MockEthProvider, EthEvmConfig, EthPayloadTypes> {
+        ValidationApi::new(
+            provider,
+            NoopConsensus::arc(),
+            EthEvmConfig::mainnet(),
+            ValidationApiConfig { disallow, ..Default::default() },
+            Runtime::test(),
+            Arc::new(FixedBlockPayloadValidator(block)),
+            None,
+        )
+    }
+
+    /// The relay sends `transaction_filter` on every submission version, so the V6 handler has to
+    /// honour it: a submission whose only transaction comes from a disallowed sender must be
+    /// rejected when the request asks for OFAC filtering.
+    #[tokio::test]
+    async fn test_v6_applies_the_ofac_transaction_filter() {
+        let (provider, mut request, block, sender) = v6_submission_with_one_sender();
+        request.transaction_filter = TransactionFilter::OFAC;
+
+        let err = v6_validation_api(provider, block, AddressSet::from_iter([sender]))
+            .validate_builder_submission_v6(request)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, ValidationApiError::Blacklist(address) if address == sender),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// The counterpart: the same submission, the same disallow list, filtering off. The sender
+    /// must get past the blacklist, so the rejection above is the filter and not the fixture.
+    #[tokio::test]
+    async fn test_v6_skips_the_filter_when_not_requested() {
+        let (provider, mut request, block, sender) = v6_submission_with_one_sender();
+        request.transaction_filter = TransactionFilter::None;
+
+        let result = v6_validation_api(provider, block, AddressSet::from_iter([sender]))
+            .validate_builder_submission_v6(request)
+            .await;
+
+        assert!(
+            !matches!(result, Err(ValidationApiError::Blacklist(_))),
+            "the disallow list was consulted without the filter: {result:?}"
+        );
     }
 
     /// Execution state for a block in which `address` ended up poorer than it started.

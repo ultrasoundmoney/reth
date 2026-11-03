@@ -4,7 +4,7 @@ use crate::args::{
     types::{MaxU32, ZeroAsNoneU64},
     GasPriceOracleArgs, RpcStateCacheArgs,
 };
-use alloy_primitives::{map::AddressSet, utils::format_ether};
+use alloy_primitives::utils::format_ether;
 use alloy_rpc_types_engine::JwtSecret;
 use clap::{
     builder::{PossibleValue, RangedU64ValueParser, Resettable, TypedValueParser},
@@ -95,7 +95,8 @@ pub struct DefaultRpcServerArgs {
     rpc_proof_permits: usize,
     rpc_pending_block: PendingBlockKind,
     rpc_forwarder: Option<Url>,
-    builder_disallow: Option<AddressSet>,
+    builder_disallow_url: Option<String>,
+    ssz_block_validation_port: Option<u16>,
     pub(super) rpc_state_cache: RpcStateCacheArgs,
     pub(super) gas_price_oracle: GasPriceOracleArgs,
     rpc_send_raw_transaction_sync_timeout: Duration,
@@ -364,9 +365,15 @@ impl DefaultRpcServerArgs {
         self
     }
 
-    /// Set the default builder disallow addresses
-    pub fn with_builder_disallow(mut self, v: Option<AddressSet>) -> Self {
-        self.builder_disallow = v;
+    /// Set the default builder disallow list url
+    pub fn with_builder_disallow_url(mut self, v: Option<String>) -> Self {
+        self.builder_disallow_url = v;
+        self
+    }
+
+    /// Set the default SSZ block validation server port
+    pub const fn with_ssz_block_validation_port(mut self, v: Option<u16>) -> Self {
+        self.ssz_block_validation_port = v;
         self
     }
 
@@ -434,7 +441,8 @@ impl Default for DefaultRpcServerArgs {
             rpc_proof_permits: constants::DEFAULT_PROOF_PERMITS,
             rpc_pending_block: PendingBlockKind::Full,
             rpc_forwarder: None,
-            builder_disallow: None,
+            builder_disallow_url: None,
+            ssz_block_validation_port: None,
             rpc_state_cache: RpcStateCacheArgs::default(),
             gas_price_oracle: GasPriceOracleArgs::default(),
             rpc_send_raw_transaction_sync_timeout:
@@ -741,19 +749,23 @@ pub struct RpcServerArgs {
     )]
     pub rpc_forwarder: Option<Url>,
 
-    /// Path to file containing disallowed addresses, json-encoded list of strings. Block
-    /// validation API will reject blocks containing transactions from these addresses.
-    #[arg(
-        long = "builder.disallow",
-        value_name = "PATH",
-        value_parser = DefaultValueParser {
-            inner: reth_cli_util::parsers::read_json_from_file::<AddressSet>,
-            default: &DefaultRpcServerArgs::get_global().builder_disallow,
-        },
-        default_value = Resettable::from(DefaultRpcServerArgs::get_global().builder_disallow.as_ref().map(|_| "configured".into())),
-        hide_default_value = true,
-    )]
-    pub builder_disallow: Option<AddressSet>,
+    /// URL to fetch the disallowed-address list from (json array of address strings). The block
+    /// validation API refreshes from it periodically; if unset, the disallow list is empty.
+    #[arg(long = "builder.disallow-url", value_name = "URL", default_value = Resettable::from(DefaultRpcServerArgs::get_global().builder_disallow_url.as_ref().map(|v| v.clone().into())))]
+    pub builder_disallow_url: Option<String>,
+
+    /// Port for the SSZ transport of the block validation API, bound on `--http.addr`: it takes
+    /// `flashbots_validateBuilderSubmissionV5` requests SSZ-encoded instead of as JSON. Disabled
+    /// if unset.
+    #[arg(long = "ssz-block-validation.port", value_name = "PORT", default_value = Resettable::from(DefaultRpcServerArgs::get_global().ssz_block_validation_port.map(|v| v.to_string().into())))]
+    pub ssz_block_validation_port: Option<u16>,
+
+    /// Let the block validation API execute JIT-compiled bytecode.
+    ///
+    /// Only takes effect in a binary built with the `jit` feature and with JIT compilation enabled
+    /// (`--jit` or the `reth_jit` RPC method).
+    #[arg(long = "builder.validation-jit", default_value_t = false)]
+    pub builder_validation_jit: bool,
 
     /// State cache configuration.
     #[command(flatten)]
@@ -980,7 +992,8 @@ impl Default for RpcServerArgs {
             rpc_proof_permits,
             rpc_pending_block,
             rpc_forwarder,
-            builder_disallow,
+            builder_disallow_url,
+            ssz_block_validation_port,
             rpc_state_cache,
             gas_price_oracle,
             rpc_send_raw_transaction_sync_timeout,
@@ -1029,10 +1042,12 @@ impl Default for RpcServerArgs {
             rpc_proof_permits,
             rpc_pending_block,
             rpc_forwarder,
-            builder_disallow,
+            builder_disallow_url,
+            ssz_block_validation_port,
             rpc_state_cache,
             gas_price_oracle,
             rpc_send_raw_transaction_sync_timeout,
+            builder_validation_jit: false,
             testing_skip_invalid_transactions: false,
             testing_gas_limit: None,
             rpc_force_blob_sidecar_upcasting: false,
@@ -1342,7 +1357,8 @@ mod tests {
             rpc_proof_permits: 16,
             rpc_pending_block: PendingBlockKind::Full,
             rpc_forwarder: Some("http://localhost:8545".parse().unwrap()),
-            builder_disallow: None,
+            builder_disallow_url: None,
+            ssz_block_validation_port: None,
             rpc_state_cache: RpcStateCacheArgs {
                 max_blocks: 5000,
                 max_receipts: 2000,
@@ -1362,6 +1378,7 @@ mod tests {
                 default_suggested_fee: None,
             },
             rpc_send_raw_transaction_sync_timeout: std::time::Duration::from_secs(30),
+            builder_validation_jit: true,
             testing_skip_invalid_transactions: true,
             testing_gas_limit: None,
             rpc_force_blob_sidecar_upcasting: false,
@@ -1457,6 +1474,7 @@ mod tests {
             "60",
             "--rpc.send-raw-transaction-sync-timeout",
             "30s",
+            "--builder.validation-jit",
             "--testing.skip-invalid-transactions",
         ])
         .args;

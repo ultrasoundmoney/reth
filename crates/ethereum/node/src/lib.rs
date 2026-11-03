@@ -32,3 +32,4 @@ pub mod engine_ssz_proxy;
 pub mod engine_ssz_witness;
 
 pub mod snap;
+pub mod validation_ssz;
