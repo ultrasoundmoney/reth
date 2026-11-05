@@ -6,7 +6,10 @@ use crate::{
         IntermediateRootState, IntermediateStateRootState, IntermediateStorageRootState,
         StateRootProgress, StorageRootProgress,
     },
-    stats::TrieTracker,
+    stats::{
+        is_collecting_state_root_counters, record_state_root_counters, StateRootCounters,
+        TrieTracker,
+    },
     trie_cursor::{TrieCursor, TrieCursorFactory, TrieCursorIter, TrieStorageCursor},
     updates::{StorageTrieUpdates, TrieUpdates},
     walker::TrieWalker,
@@ -17,7 +20,7 @@ use alloy_primitives::{keccak256, map::B256Map, Address, B256, U256};
 use alloy_rlp::{BufMut, Encodable};
 use alloy_trie::proof::AddedRemovedKeys;
 use reth_execution_errors::{StateRootError, StorageRootError};
-use reth_primitives_traits::Account;
+use reth_primitives_traits::{Account, FastInstant as Instant};
 use tracing::{debug, instrument, trace, Span};
 
 /// The default updates after which root algorithms should return intermediate progress rather than
@@ -186,6 +189,9 @@ where
         // create state root context once for reuse
         let mut storage_ctx = StateRootContext::new();
 
+        let mut attribution =
+            is_collecting_state_root_counters().then(|| LeafAttribution::new(&self.prefix_sets));
+
         // first handle any in-progress storage root calculation
         let (mut hash_builder, mut account_node_iter) = if let Some(state) = self.previous_state {
             let IntermediateStateRootState { account_root_state, storage_root_state } = state;
@@ -244,6 +250,7 @@ where
                 .calculate(
                     storage_trie_cursor.as_mut().expect("storage trie cursor is initialized"),
                     hashed_storage_cursor.as_mut().expect("hashed storage cursor is initialized"),
+                    None,
                     #[cfg(feature = "metrics")]
                     &self.metrics.storage_trie,
                 )?;
@@ -301,14 +308,15 @@ where
                             Some(self.trie_cursor_factory.storage_trie_cursor(hashed_address)?);
                     }
 
+                    let storage_prefix_set =
+                        self.prefix_sets.storage_prefix_sets.get(&hashed_address);
+                    let has_storage_changes = storage_prefix_set.is_some();
+                    let storage_started_at = attribution.is_some().then(Instant::now);
+                    let mut storage_branches = 0;
+
                     let storage_result = StorageRootCalculation {
                         hashed_address,
-                        prefix_set: self
-                            .prefix_sets
-                            .storage_prefix_sets
-                            .get(&hashed_address)
-                            .cloned()
-                            .unwrap_or_default(),
+                        prefix_set: storage_prefix_set.cloned().unwrap_or_default(),
                         previous_state: None,
                         walk_all_changed_branch_children: self.walk_all_changed_branch_children,
                         threshold: remaining_threshold,
@@ -319,9 +327,22 @@ where
                         hashed_storage_cursor
                             .as_mut()
                             .expect("hashed storage cursor is initialized"),
+                        attribution.is_some().then_some(&mut storage_branches),
                         #[cfg(feature = "metrics")]
                         &self.metrics.storage_trie,
                     )?;
+
+                    if let (Some(attribution), Some(started_at)) =
+                        (&mut attribution, storage_started_at)
+                    {
+                        attribution.record_leaf(
+                            hashed_address,
+                            has_storage_changes,
+                            started_at.elapsed(),
+                            storage_branches,
+                            &storage_result,
+                        );
+                    }
                     if let Some(storage_state) = storage_ctx.process_storage_root_result(
                         storage_result,
                         hashed_address,
@@ -383,6 +404,13 @@ where
         #[cfg(feature = "metrics")]
         self.metrics.state_trie.record(stats);
 
+        if let Some(LeafAttribution { mut counters, .. }) = attribution {
+            counters.account_leaves = stats.leaves_added();
+            counters.account_branches = stats.branches_added();
+            counters.duration = stats.duration();
+            record_state_root_counters(|collected| collected.add(&counters));
+        }
+
         trace!(
             target: "trie::state_root",
             %root,
@@ -393,6 +421,53 @@ where
         );
 
         Ok(StateRootProgress::Complete(root, hashed_entries_walked, trie_updates))
+    }
+}
+
+/// Attributes the storage root work of account leaves to [`StateRootCounters`].
+#[derive(Debug)]
+struct LeafAttribution {
+    counters: StateRootCounters,
+    account_prefix_set: PrefixSet,
+}
+
+impl LeafAttribution {
+    fn new(prefix_sets: &TriePrefixSets) -> Self {
+        Self {
+            counters: StateRootCounters {
+                account_prefix_set_len: prefix_sets.account_prefix_set.len() as u64,
+                storage_prefix_sets: prefix_sets.storage_prefix_sets.len() as u64,
+                ..Default::default()
+            },
+            account_prefix_set: prefix_sets.account_prefix_set.clone(),
+        }
+    }
+
+    /// Leaves arrive in key order, which keeps the prefix set lookups amortized constant.
+    fn record_leaf(
+        &mut self,
+        hashed_address: B256,
+        has_storage_changes: bool,
+        duration: core::time::Duration,
+        storage_branches: u64,
+        storage_result: &StorageRootProgress,
+    ) {
+        let counters = &mut self.counters;
+
+        if !self.account_prefix_set.contains(&Nibbles::unpack(hashed_address)) {
+            counters.untouched_account_leaves += 1;
+        }
+        if has_storage_changes {
+            counters.storage_roots_with_changes += 1;
+            counters.storage_roots_with_changes_duration += duration;
+        } else {
+            counters.storage_roots_without_changes += 1;
+            counters.storage_roots_without_changes_duration += duration;
+        }
+        counters.storage_branches += storage_branches;
+        let (StorageRootProgress::Complete(_, slots, _) |
+        StorageRootProgress::Progress(_, slots, _)) = storage_result;
+        counters.storage_slots += *slots as u64;
     }
 }
 
@@ -722,6 +797,7 @@ where
         .calculate(
             &mut storage_trie_cursor,
             &mut hashed_storage_cursor,
+            None,
             #[cfg(feature = "metrics")]
             &metrics,
         )
@@ -765,6 +841,7 @@ where
         .calculate(
             &mut storage_trie_cursor,
             hashed_storage_cursor,
+            None,
             #[cfg(feature = "metrics")]
             &metrics,
         )
@@ -788,6 +865,7 @@ impl StorageRootCalculation {
         self,
         trie_cursor: &mut TC,
         hashed_storage_cursor: &mut HC,
+        branches_added: Option<&mut u64>,
         #[cfg(feature = "metrics")] metrics: &TrieRootMetrics,
     ) -> Result<StorageRootProgress, StorageRootError>
     where
@@ -897,6 +975,10 @@ impl StorageRootCalculation {
         #[cfg(feature = "metrics")]
         metrics.record(stats);
 
+        if let Some(branches_added) = branches_added {
+            *branches_added = stats.branches_added();
+        }
+
         trace!(
             target: "trie::storage_root",
             %root,
@@ -931,5 +1013,95 @@ impl TrieType {
             Self::Storage => "storage",
             Self::Custom(s) => s,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        hashed_cursor::mock::MockHashedCursorFactory,
+        prefix_set::{PrefixSetMut, TriePrefixSetsMut},
+        stats::{collect_state_root_counters, is_collecting_state_root_counters},
+        test_utils::state_root_prehashed,
+        trie_cursor::mock::MockTrieCursorFactory,
+    };
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn state_root_counters_attribute_leaves_to_changed_and_untouched_accounts() {
+        let changed_eoa = B256::with_last_byte(1);
+        let changed_contract = B256::with_last_byte(2);
+        let untouched_eoa = B256::with_last_byte(3);
+        let untouched_contract = B256::with_last_byte(4);
+        let addresses = [changed_eoa, changed_contract, untouched_eoa, untouched_contract];
+
+        let account =
+            Account { nonce: 1, balance: U256::from(1), bytecode_hash: None, ..Default::default() };
+        let storage_of = |address: B256| -> BTreeMap<B256, U256> {
+            if address == changed_contract {
+                (1..=3).map(|slot| (B256::with_last_byte(slot), U256::from(slot))).collect()
+            } else if address == untouched_contract {
+                (1..=2).map(|slot| (B256::with_last_byte(slot), U256::from(slot))).collect()
+            } else {
+                BTreeMap::new()
+            }
+        };
+
+        let hashed_cursor_factory = MockHashedCursorFactory::new(
+            addresses.iter().map(|address| (*address, account.clone())).collect(),
+            addresses.iter().map(|address| (*address, storage_of(*address))).collect(),
+        );
+        let trie_cursor_factory = MockTrieCursorFactory::new(
+            BTreeMap::new(),
+            addresses.iter().map(|address| (*address, BTreeMap::new())).collect(),
+        );
+
+        let mut changed_storage = PrefixSetMut::default();
+        changed_storage.insert(Nibbles::unpack(B256::with_last_byte(1)));
+        let prefix_sets = TriePrefixSetsMut {
+            account_prefix_set: PrefixSetMut::from(
+                [changed_eoa, changed_contract].map(|address| Nibbles::unpack(address)),
+            ),
+            storage_prefix_sets: std::iter::once((changed_contract, changed_storage)).collect(),
+            destroyed_accounts: Default::default(),
+        }
+        .freeze();
+
+        let state_root = || {
+            StateRoot::new(trie_cursor_factory.clone(), hashed_cursor_factory.clone())
+                .with_prefix_sets(prefix_sets.clone())
+                .root()
+                .unwrap()
+        };
+
+        let (root, counters) = collect_state_root_counters(state_root);
+
+        assert!(!is_collecting_state_root_counters());
+        assert_eq!(root, state_root());
+        assert_eq!(
+            root,
+            state_root_prehashed(
+                addresses.iter().map(|address| (*address, (account.clone(), storage_of(*address))))
+            )
+        );
+        assert_eq!(
+            StateRootCounters {
+                storage_roots_without_changes_duration: Default::default(),
+                storage_roots_with_changes_duration: Default::default(),
+                duration: Default::default(),
+                ..counters
+            },
+            StateRootCounters {
+                account_prefix_set_len: 2,
+                storage_prefix_sets: 1,
+                account_leaves: 4,
+                untouched_account_leaves: 2,
+                storage_roots_without_changes: 3,
+                storage_roots_with_changes: 1,
+                storage_slots: 5,
+                ..Default::default()
+            }
+        );
     }
 }

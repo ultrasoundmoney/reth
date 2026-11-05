@@ -37,15 +37,21 @@ pub struct StateTrieOverlay {
     input: TrieInputSorted,
     /// Whether construction was skipped because a reused sparse trie covers this range.
     skipped_for_reused_sparse_trie: bool,
+    /// Whether the database had to be reverted to an older anchor.
+    reverts_required: bool,
 }
 
 impl StateTrieOverlay {
     pub(crate) const fn new(input: TrieInputSorted) -> Self {
-        Self { input, skipped_for_reused_sparse_trie: false }
+        Self { input, skipped_for_reused_sparse_trie: false, reverts_required: false }
     }
 
     fn empty() -> Self {
-        Self { input: TrieInputSorted::default(), skipped_for_reused_sparse_trie: true }
+        Self {
+            input: TrieInputSorted::default(),
+            skipped_for_reused_sparse_trie: true,
+            reverts_required: false,
+        }
     }
 
     /// Returns the trie input represented by this overlay.
@@ -55,6 +61,10 @@ impl StateTrieOverlay {
 
     pub(crate) const fn skipped_for_reused_sparse_trie(&self) -> bool {
         self.skipped_for_reused_sparse_trie
+    }
+
+    pub(crate) const fn reverts_required(&self) -> bool {
+        self.reverts_required
     }
 }
 
@@ -589,11 +599,14 @@ impl<N: NodePrimitives> OverlayBuilder<N> {
         self.metrics.trie_updates_size.record(trie_updates_total_len as f64);
         self.metrics.hashed_state_size.record(hashed_state_updates_total_len as f64);
 
-        Ok(StateTrieOverlay::new(TrieInputSorted::new(
-            trie_updates,
-            hashed_post_state,
-            prefix_sets,
-        )))
+        Ok(StateTrieOverlay {
+            reverts_required: matches!(anchor_for_parent, AnchorForParent::RevertsRequired { .. }),
+            ..StateTrieOverlay::new(TrieInputSorted::new(
+                trie_updates,
+                hashed_post_state,
+                prefix_sets,
+            ))
+        })
     }
 
     /// Returns the in-memory execution overlay and the block for historical fallback reads.
