@@ -10321,6 +10321,7 @@ dependencies = [
  "reth-tasks",
  "reth-testing-utils",
  "reth-transaction-pool",
+ "reth-trie",
  "reth-trie-common",
  "serde",
  "serde_json",
