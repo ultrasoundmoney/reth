@@ -33,7 +33,7 @@ use reth_evm::{
 use reth_execution_types::BlockExecutionOutput;
 use reth_metrics::{
     metrics,
-    metrics::{gauge, Gauge},
+    metrics::{gauge, Counter, Gauge, Histogram},
     Metrics,
 };
 use reth_payload_primitives::{NewPayloadError, PayloadTypes};
@@ -51,11 +51,16 @@ use reth_storage_api::{
     AccountReader, BlockReaderIdExt, HashedPostStateProvider, StateProvider, StateProviderFactory,
 };
 use reth_tasks::Runtime;
+use reth_trie::{
+    stats::{collect_state_root_counters, StateRootCounters},
+    HashedPostState,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
     sync::{Arc, LazyLock},
+    time::Instant,
 };
 use tokio::sync::{oneshot, RwLock};
 use tracing::warn;
@@ -304,13 +309,21 @@ where
         F: Future<Output = Result<(), ValidationApiError>> + Send + 'static,
     {
         let (mut tx, rx) = oneshot::channel();
+        let queue_duration = self.metrics.queue_duration_seconds.clone();
+        let total_duration = self.metrics.total_duration_seconds.clone();
+        let spawned_at = Instant::now();
 
         self.task_spawner.spawn_blocking_task(async move {
+            let started_at = Instant::now();
+            queue_duration.record(started_at - spawned_at);
+
             let result = tokio::select! {
                 biased;
                 _ = tx.closed() => return,
                 result = validation => result.map_err(ErrorObject::from),
             };
+            total_duration.record(started_at.elapsed());
+
             let _ = tx.send(result);
         });
 
@@ -336,6 +349,8 @@ where
         transaction_filter: TransactionFilter,
         decoded_bal: Option<DecodedBal>,
     ) -> Result<(), ValidationApiError> {
+        let pre_execution_started_at = Instant::now();
+
         self.validate_message_against_header(block.sealed_header(), &message)?;
 
         self.consensus.validate_header(block.sealed_header())?;
@@ -403,8 +418,12 @@ where
 
         let parent_header_hash = parent_header.hash();
         let state_provider = self.provider.state_by_block_hash(parent_header_hash)?;
+        self.metrics.pre_execution_duration_seconds.record(pre_execution_started_at.elapsed());
 
+        let cached_reads_started_at = Instant::now();
         let mut request_cache = self.cached_reads(parent_header_hash).await;
+        self.metrics.cached_reads_duration_seconds.record(cached_reads_started_at.elapsed());
+
         let mut accessed_accounts = AddressSet::default();
 
         let (output, block_access_list_hash) = {
@@ -412,6 +431,7 @@ where
                 .as_db_mut(StateProviderDatabase::new((&state_provider).into_evm_state_provider()));
             let recording_db =
                 AccountRecordingDb { db: cached_db, accounts: &mut accessed_accounts };
+            let execution_started_at = Instant::now();
             let mut executor = self.evm_config.batch_executor(recording_db);
 
             let result = executor.execute_one(&block)?;
@@ -424,7 +444,11 @@ where
                 executor.take_bal().map(|bal| compute_block_access_list_hash(&bal));
 
             let state = executor.into_state();
+            self.metrics.execution_duration_seconds.record(execution_started_at.elapsed());
+
             if let Some(disallow) = &disallow {
+                let disallow_scan_started_at = Instant::now();
+
                 // `request_cache` also holds reads of earlier submissions on the same parent, so
                 // only this execution's own reads are checked.
                 for account in accessed_accounts.iter().chain(state.state.keys()) {
@@ -432,25 +456,50 @@ where
                         return Err(ValidationApiError::Blacklist(*account))
                     }
                 }
+
+                self.metrics
+                    .disallow_scan_duration_seconds
+                    .record(disallow_scan_started_at.elapsed());
             }
 
             (BlockExecutionOutput { state, result }, block_access_list_hash)
         };
 
-        // update the cached reads
+        let update_cached_reads_started_at = Instant::now();
         self.update_cached_reads(parent_header_hash, request_cache).await;
+        self.metrics
+            .update_cached_reads_duration_seconds
+            .record(update_cached_reads_started_at.elapsed());
 
+        let post_execution_started_at = Instant::now();
         self.consensus.validate_block_post_execution(
             &block,
             &output,
             None,
             block_access_list_hash,
         )?;
+        self.metrics.post_execution_duration_seconds.record(post_execution_started_at.elapsed());
 
+        let payment_started_at = Instant::now();
         self.ensure_payment(&block, &output, &message)?;
+        self.metrics.payment_duration_seconds.record(payment_started_at.elapsed());
 
-        let hashed_state = state_provider.hashed_post_state(&output.state)?;
-        let state_root = state_provider.state_root(hashed_state)?;
+        let (state_root, counters) = collect_state_root_counters(|| {
+            let hashed_post_state_started_at = Instant::now();
+            let hashed_state = state_provider.hashed_post_state(&output.state)?;
+            self.metrics
+                .hashed_post_state_duration_seconds
+                .record(hashed_post_state_started_at.elapsed());
+            self.metrics.record_hashed_post_state(&hashed_state);
+
+            let state_root_started_at = Instant::now();
+            let state_root = state_provider.state_root(hashed_state)?;
+            self.metrics.state_root_duration_seconds.record(state_root_started_at.elapsed());
+
+            Ok::<_, ProviderError>(state_root)
+        });
+        let state_root = state_root?;
+        self.metrics.record_state_root_counters(&counters);
 
         if state_root != block.header().state_root() {
             return Err(ConsensusError::BodyStateRootDiff(
@@ -641,11 +690,15 @@ where
         &self,
         blobs_bundle: BlobsBundleV1,
     ) -> Result<Vec<B256>, ValidationApiError> {
+        let started_at = Instant::now();
+
         let versioned_hashes = blobs_bundle.versioned_hashes();
         let sidecar =
             blobs_bundle.try_into_sidecar().map_err(|_| ValidationApiError::InvalidBlobsBundle)?;
 
         sidecar.validate(&versioned_hashes, EnvKzgSettings::default().get())?;
+
+        self.metrics.blob_validation_duration_seconds.record(started_at.elapsed());
         Ok(versioned_hashes)
     }
 
@@ -658,7 +711,10 @@ where
         &self,
         blobs_bundle: BlobsBundleV2,
     ) -> Result<Vec<B256>, ValidationApiError> {
-        self.validated_blobs.validate(blobs_bundle)
+        let started_at = Instant::now();
+        let versioned_hashes = self.validated_blobs.validate(blobs_bundle)?;
+        self.metrics.blob_validation_duration_seconds.record(started_at.elapsed());
+        Ok(versioned_hashes)
     }
 
     /// Converts the payload into a block and recovers the transaction senders.
@@ -673,6 +729,16 @@ where
     /// the same slot share most of their transactions, so the senders are likely to be needed again
     /// even if this submission is rejected, and only successfully recovered senders can be cached.
     fn recover_payload(
+        &self,
+        payload: ExecutionData,
+    ) -> Result<RecoveredBlock<<E::Primitives as NodePrimitives>::Block>, ValidationApiError> {
+        let started_at = Instant::now();
+        let block = self.convert_and_recover_payload(payload)?;
+        self.metrics.payload_recovery_duration_seconds.record(started_at.elapsed());
+        Ok(block)
+    }
+
+    fn convert_and_recover_payload(
         &self,
         payload: ExecutionData,
     ) -> Result<RecoveredBlock<<E::Primitives as NodePrimitives>::Block>, ValidationApiError> {
@@ -1126,11 +1192,109 @@ impl From<ValidationApiError> for ErrorObject<'static> {
 }
 
 /// Metrics for the validation endpoint.
+///
+/// Phase durations are recorded for every request that reaches the end of the phase, so a
+/// request rejected early only contributes to the phases it completed.
 #[derive(Metrics)]
 #[metrics(scope = "builder.validation")]
 pub(crate) struct ValidationMetrics {
     /// The number of entries configured in the builder validation disallow list.
     pub(crate) disallow_size: Gauge,
+    /// Time a request waited for a blocking task.
+    queue_duration_seconds: Histogram,
+    /// Time from the start of the blocking task to the validation result, valid or not.
+    total_duration_seconds: Histogram,
+    /// Blob bundle validation, including KZG proof checks not served by the blob cache.
+    blob_validation_duration_seconds: Histogram,
+    /// Payload to block conversion and sender recovery.
+    payload_recovery_duration_seconds: Histogram,
+    /// Header and pre-execution checks, the disallow pre-check, the parent lookup and opening
+    /// the state provider.
+    pre_execution_duration_seconds: Histogram,
+    /// Waiting for and cloning the cached reads of the parent.
+    cached_reads_duration_seconds: Histogram,
+    /// Block execution, including building the block access list.
+    execution_duration_seconds: Histogram,
+    /// Checking the accounts the execution touched against the disallow list.
+    disallow_scan_duration_seconds: Histogram,
+    /// Merging this execution's reads into the shared cached reads.
+    update_cached_reads_duration_seconds: Histogram,
+    /// `validate_block_post_execution`.
+    post_execution_duration_seconds: Histogram,
+    /// The proposer payment check.
+    payment_duration_seconds: Histogram,
+    /// Hashing the execution output into a `HashedPostState`.
+    hashed_post_state_duration_seconds: Histogram,
+    /// The state root, including building the trie overlay of the parent.
+    state_root_duration_seconds: Histogram,
+    /// The trie walk of the state root, excluding the overlay build.
+    state_root_walk_duration_seconds: Histogram,
+    /// Storage roots of account leaves without storage changes.
+    state_root_storage_roots_without_changes_duration_seconds: Histogram,
+    /// Storage roots of account leaves with storage changes.
+    state_root_storage_roots_with_changes_duration_seconds: Histogram,
+    /// Changed accounts in the `HashedPostState`.
+    hashed_post_state_accounts: Histogram,
+    /// Storage tries with changed slots in the `HashedPostState`.
+    hashed_post_state_storages: Histogram,
+    /// Changed storage slots in the `HashedPostState`.
+    hashed_post_state_storage_slots: Histogram,
+    /// Keys in the account prefix set the walker used, including keys an overlay added.
+    state_root_account_prefix_set_len: Histogram,
+    /// Storage tries in the storage prefix sets the walker used.
+    state_root_storage_prefix_sets: Histogram,
+    /// Account leaves the walker emitted, each of which gets a storage root.
+    state_root_account_leaves: Histogram,
+    /// Emitted account leaves outside the account prefix set.
+    state_root_untouched_account_leaves: Histogram,
+    /// Storage roots computed for account leaves without storage changes.
+    state_root_storage_roots_without_changes: Histogram,
+    /// Storage roots computed for account leaves with storage changes.
+    state_root_storage_roots_with_changes: Histogram,
+    /// Stored account trie branch hashes the hash builder reused.
+    state_root_account_branches: Histogram,
+    /// Stored storage trie branch hashes the hash builder reused.
+    state_root_storage_branches: Histogram,
+    /// Storage slots fed to the hash builder.
+    state_root_storage_slots: Histogram,
+    /// State roots whose trie overlay had to revert the database to an older anchor.
+    state_root_reverts_required_total: Counter,
+}
+
+impl ValidationMetrics {
+    fn record_hashed_post_state(&self, hashed_state: &HashedPostState) {
+        self.hashed_post_state_accounts.record(hashed_state.accounts.len() as f64);
+        self.hashed_post_state_storages.record(
+            hashed_state.storages.values().filter(|storage| !storage.storage.is_empty()).count()
+                as f64,
+        );
+        self.hashed_post_state_storage_slots.record(
+            hashed_state.storages.values().map(|storage| storage.storage.len()).sum::<usize>()
+                as f64,
+        );
+    }
+
+    fn record_state_root_counters(&self, counters: &StateRootCounters) {
+        self.state_root_walk_duration_seconds.record(counters.duration);
+        self.state_root_storage_roots_without_changes_duration_seconds
+            .record(counters.storage_roots_without_changes_duration);
+        self.state_root_storage_roots_with_changes_duration_seconds
+            .record(counters.storage_roots_with_changes_duration);
+        self.state_root_account_prefix_set_len.record(counters.account_prefix_set_len as f64);
+        self.state_root_storage_prefix_sets.record(counters.storage_prefix_sets as f64);
+        self.state_root_account_leaves.record(counters.account_leaves as f64);
+        self.state_root_untouched_account_leaves.record(counters.untouched_account_leaves as f64);
+        self.state_root_storage_roots_without_changes
+            .record(counters.storage_roots_without_changes as f64);
+        self.state_root_storage_roots_with_changes
+            .record(counters.storage_roots_with_changes as f64);
+        self.state_root_account_branches.record(counters.account_branches as f64);
+        self.state_root_storage_branches.record(counters.storage_branches as f64);
+        self.state_root_storage_slots.record(counters.storage_slots as f64);
+        if counters.reverts_required {
+            self.state_root_reverts_required_total.increment(1);
+        }
+    }
 }
 
 #[cfg(test)]
