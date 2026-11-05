@@ -26,6 +26,7 @@ use reth_trie::{
     },
     proof::{Proof, StorageProof as TrieStorageProof},
     proof_v2::ProofCursorMetrics,
+    stats::record_state_root_counters,
     trie_cursor::{
         InMemoryTrieCursor, InMemoryTrieCursorFactory, TrieCursor, TrieCursorFactory,
         TrieStorageCursor,
@@ -366,6 +367,9 @@ where
         let overlay = self.state_trie_overlay(trie_changesets)?;
         if overlay.skipped_for_reused_sparse_trie() {
             return Err(ProviderError::UnsupportedProvider)
+        }
+        if overlay.reverts_required() {
+            record_state_root_counters(|counters| counters.reverts_required = true);
         }
         let TrieInputSorted { nodes: input_nodes, state: input_state, mut prefix_sets } = input;
         let overlay_input = overlay.input();
