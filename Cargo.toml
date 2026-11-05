@@ -319,6 +319,11 @@ inherits = "maxperf"
 debug = "full"
 strip = "none"
 
+[profile.maxperf-line-tables]
+inherits = "maxperf"
+debug = "line-tables-only"
+strip = "none"
+
 [profile.reproducible]
 inherits = "release"
 panic = "abort"

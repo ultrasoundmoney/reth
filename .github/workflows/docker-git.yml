@@ -49,7 +49,7 @@ jobs:
         run: |
           docker buildx build --file ./Dockerfile . \
             --platform "${BUILD_PLATFORMS}" \
-            --build-arg BUILD_PROFILE=maxperf \
+            --build-arg BUILD_PROFILE=maxperf-line-tables \
             --tag "${DOCKER_IMAGE_NAME}:${GIT_SHA}" \
             --provenance=false \
             --push
