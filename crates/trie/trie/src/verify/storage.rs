@@ -103,6 +103,7 @@ where
             .calculate(
                 &mut NoopStorageTrieCursor::default(),
                 &mut self.hashed,
+                None,
                 #[cfg(feature = "metrics")]
                 metrics,
             )?;
