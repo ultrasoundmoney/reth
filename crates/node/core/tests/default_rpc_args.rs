@@ -1,6 +1,5 @@
 //! Regression coverage for configurable RPC CLI defaults.
 
-use alloy_primitives::{map::AddressSet, Address};
 use alloy_rpc_types_engine::JwtSecret;
 use clap::{CommandFactory, Parser};
 use reth_node_core::args::{DefaultRpcServerArgs, RpcServerArgs, RpcStateCacheArgs};
@@ -22,7 +21,7 @@ fn custom_rpc_defaults_apply_to_cli() {
         ))
         .with_rpc_send_raw_transaction_sync_timeout(Duration::from_millis(250))
         .with_rpc_jwtsecret(Some(JwtSecret::from_hex("11".repeat(32)).unwrap()))
-        .with_builder_disallow(Some(AddressSet::from_iter([Address::repeat_byte(1)])))
+        .with_builder_disallow_url(Some("http://localhost:1111/ofac".into()))
         .with_rpc_state_cache(RpcStateCacheArgs {
             max_blocks: 1,
             max_receipts: 2,
@@ -70,8 +69,8 @@ fn custom_rpc_defaults_apply_to_cli() {
         "2s",
         "--rpc.jwtsecret",
         &jwt,
-        "--builder.disallow",
-        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/disallowed-addresses.json"),
+        "--builder.disallow-url",
+        "http://localhost:2222/ofac",
         "--rpc-cache.max-blocks",
         "8",
         "--rpc-cache.prewarm-bals",
@@ -82,7 +81,7 @@ fn custom_rpc_defaults_apply_to_cli() {
         rpc_forwarder: Some("http://localhost:5678".parse().unwrap()),
         rpc_send_raw_transaction_sync_timeout: Duration::from_secs(2),
         rpc_jwtsecret: Some(JwtSecret::from_hex(jwt).unwrap()),
-        builder_disallow: Some(AddressSet::default()),
+        builder_disallow_url: Some("http://localhost:2222/ofac".into()),
         ..Default::default()
     };
     expected.rpc_state_cache.max_blocks = 8;
